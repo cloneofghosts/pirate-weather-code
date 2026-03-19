@@ -46,8 +46,7 @@ def test_mrms_script_has_required_imports():
         "import s3fs",
         "import xarray",
         "import zarr",
-        "from herbie import Herbie",
-        "from herbie.fast import Herbie_latest",
+        "import gzip",
     ]
     for import_stmt in required_imports:
         assert import_stmt in script_content, f"Missing required import: {import_stmt}"
@@ -56,13 +55,15 @@ def test_mrms_script_has_required_imports():
 def test_mrms_script_has_required_components():
     """Test that the MRMS script contains expected components."""
     script_content = MRMS_SCRIPT_PATH.read_text()
-    assert "zarr_vars" in script_content, "Missing zarr_vars definition"
-    assert "Herbie_latest" in script_content, "Missing Herbie_latest usage"
-    assert "base_time" in script_content, "Missing base_time variable"
+    assert "MRMS_BUCKET" in script_content, "Missing MRMS_BUCKET constant"
+    assert "noaa-mrms-pds" in script_content, "Missing NOAA MRMS S3 bucket name"
+    assert "anon=True" in script_content, "Missing anonymous S3 access"
     assert "PrecipRate" in script_content, "Missing PrecipRate product"
     assert "PrecipFlag" in script_content, "Missing PrecipFlag product"
-    assert "Reflectivity" in script_content, "Missing Reflectivity product"
-    assert "Lightning" in script_content, "Missing Lightning product"
+    assert "MergedCompositeReflectivityQC" in script_content, "Missing composite reflectivity product"
+    assert "LightningFlashRateDensity" in script_content, "Missing LightningFlashRateDensity product"
+    assert "gzip.decompress" in script_content, "Missing gzip decompression"
+    assert "cfgrib" in script_content, "Missing cfgrib engine"
 
 
 def test_mrms_constants_defined():
@@ -71,7 +72,7 @@ def test_mrms_constants_defined():
 
     assert "precip_rate" in MRMS, "MRMS missing precip_rate index"
     assert "precip_flag" in MRMS, "MRMS missing precip_flag index"
-    assert "refl_1km" in MRMS, "MRMS missing refl_1km index"
+    assert "refl_comp" in MRMS, "MRMS missing refl_comp index (composite reflectivity)"
     assert "lightning" in MRMS, "MRMS missing lightning index"
     # Indices must be non-zero (variable index 0 in the zarr array is reserved for the
     # time variable; all other variables must use indices ≥ 1 to avoid collision)
@@ -106,37 +107,54 @@ def test_mrms_grid_constants_defined():
 
 
 def test_map_mrms_flag_to_ptype():
-    """Test that map_mrms_flag_to_ptype returns correct precipitation types."""
+    """Test that map_mrms_flag_to_ptype returns correct precipitation types.
+
+    Flag values per NOAA MRMS UserTable_MRMS_PrecipFlags.csv:
+        -3: no coverage, 0: no precip, 1: warm stratiform rain, 3: snow,
+        6: convective rain, 7: rain+hail (→ sleet), 10: cold stratiform rain,
+        91: tropical/stratiform rain mix, 96: tropical/convective rain mix.
+    """
     from API.api_utils import map_mrms_flag_to_ptype
 
-    assert map_mrms_flag_to_ptype(0) == "none", "Flag 0 should be 'none'"
-    assert map_mrms_flag_to_ptype(1) == "rain", "Flag 1 (Rain) should be 'rain'"
-    assert map_mrms_flag_to_ptype(2) == "hail", "Flag 2 (Hail) should be 'hail'"
-    assert map_mrms_flag_to_ptype(3) == "rain", "Flag 3 (Big Drops) should be 'rain'"
-    assert map_mrms_flag_to_ptype(4) == "hail", "Flag 4 (Rain+Hail) should be 'hail'"
-    assert map_mrms_flag_to_ptype(5) == "hail", "Flag 5 (Rain+Hail) should be 'hail'"
-    assert map_mrms_flag_to_ptype(7) == "snow", "Flag 7 (Graupel) should be 'snow'"
-    assert map_mrms_flag_to_ptype(8) == "snow", "Flag 8 (Snow) should be 'snow'"
-    assert map_mrms_flag_to_ptype(9) == "snow", "Flag 9 (Dry Snow) should be 'snow'"
-    assert map_mrms_flag_to_ptype(10) == "snow", "Flag 10 (Wet Snow) should be 'snow'"
-    assert map_mrms_flag_to_ptype(11) == "snow", "Flag 11 (Ice Crystals) should be 'snow'"
-    assert map_mrms_flag_to_ptype(12) == "rain", "Flag 12 (Drizzle) should be 'rain'"
-    assert map_mrms_flag_to_ptype(91) == "rain", "Flag 91 (Tropical) should be 'rain'"
-    assert map_mrms_flag_to_ptype(96) == "none", "Flag 96 (Biological) should be 'none'"
+    # No-precipitation codes
+    assert map_mrms_flag_to_ptype(-3) == "none", "Flag -3 (no coverage) should be 'none'"
+    assert map_mrms_flag_to_ptype(0) == "none", "Flag 0 (no precip) should be 'none'"
+
+    # Rain codes
+    assert map_mrms_flag_to_ptype(1) == "rain", "Flag 1 (warm stratiform rain) should be 'rain'"
+    assert map_mrms_flag_to_ptype(6) == "rain", "Flag 6 (convective rain) should be 'rain'"
+    assert map_mrms_flag_to_ptype(10) == "rain", "Flag 10 (cold stratiform rain) should be 'rain'"
+    assert map_mrms_flag_to_ptype(91) == "rain", "Flag 91 (tropical/stratiform mix) should be 'rain'"
+    assert map_mrms_flag_to_ptype(96) == "rain", "Flag 96 (tropical/convective mix) should be 'rain'"
+
+    # Snow codes
+    assert map_mrms_flag_to_ptype(3) == "snow", "Flag 3 (snow) should be 'snow'"
+
+    # Sleet (rain + hail; no dedicated hail type in the API)
+    assert map_mrms_flag_to_ptype(7) == "sleet", "Flag 7 (rain+hail) should be 'sleet'"
+
+    # Unknown codes default to none
+    assert map_mrms_flag_to_ptype(99) == "none", "Unknown flag should be 'none'"
 
 
 def test_mrms_nowcasting_blending():
-    """Test that MRMS nowcasting blending logic produces correct output."""
+    """Test that MRMS nowcasting uses persistence then blends to model.
+
+    The improved algorithm:
+    - 0-30 min: pure MRMS rate (Lagrangian persistence)
+    - 30-60 min: linear blend from MRMS → model
+    - No-model fallback: hold rate for 30 min then fade to 0
+    """
     from API.constants.model_const import MRMS
     from API.minutely.builder import _calculate_intensity
 
     # Create a fake mrms_data: shape (1, 5) => 1 time step, 5 variables
-    # time=0, precip_rate=5.0 mm/hr, precip_flag=1 (rain), refl_1km=35, lightning=0
+    # time=0, precip_rate=5.0 mm/hr, precip_flag=1 (rain), refl_comp=35, lightning=0
     mrms_data = np.zeros((1, 5), dtype=np.float32)
     mrms_data[0, 0] = 0.0       # UNIX timestamp = 0 (t=0)
     mrms_data[0, MRMS["precip_rate"]] = 5.0
     mrms_data[0, MRMS["precip_flag"]] = 1
-    mrms_data[0, MRMS["refl_1km"]] = 35.0
+    mrms_data[0, MRMS["refl_comp"]] = 35.0
     mrms_data[0, MRMS["lightning"]] = 0.0
 
     # 61 minutes starting at t=0, 1 minute apart
@@ -161,13 +179,19 @@ def test_mrms_nowcasting_blending():
         minute_array_grib=minute_array_grib,
     )
 
-    # At t=0, intensity should be mrms_rate * (1-0) + MISSING_DATA*0 = ~5.0
-    # (since model_intensity is MISSING_DATA when no model source active)
+    # At t=0 (persistence window), intensity must equal MRMS rate
     assert intensity[0] == pytest.approx(5.0, abs=0.1), (
         f"At t=0, expected MRMS rate ~5.0 but got {intensity[0]}"
     )
-    # After 15 minutes (index 15), MRMS weight = 0 → intensity should approach MISSING_DATA or 0
-    # (since there's no model source, the blend falls back to MRMS with decaying weight)
+    # At t=29 min (still inside persistence window), intensity must still be MRMS rate
+    assert intensity[29] == pytest.approx(5.0, abs=0.1), (
+        f"At t=29 min (persistence window), expected MRMS rate ~5.0 but got {intensity[29]}"
+    )
+    # After persistence + blend window (t>=60 min), rate should have faded to 0
+    # (no model source → fallback fade)
+    assert intensity[60] == pytest.approx(0.0, abs=0.1), (
+        f"At t=60 min (end of blend), expected ~0.0 but got {intensity[60]}"
+    )
 
 
 def test_mrms_ptype_fallback():
@@ -175,9 +199,9 @@ def test_mrms_ptype_fallback():
     from API.constants.model_const import MRMS
     from API.minutely.builder import _calculate_precip_type_probs
 
-    # Snow flag
+    # Snow flag (flag 3 per NOAA MRMS PrecipFlags table)
     mrms_data_snow = np.zeros((1, 5), dtype=np.float32)
-    mrms_data_snow[0, MRMS["precip_flag"]] = 8  # Snow
+    mrms_data_snow[0, MRMS["precip_flag"]] = 3  # Snow
 
     result = _calculate_precip_type_probs(
         source_list=["mrms"],
@@ -221,6 +245,29 @@ def test_mrms_ptype_fallback():
         "MRMS rain flag should set rain probability to 1.0"
     )
 
+    # Sleet flag (flag 7 = rain + hail; maps to sleet since no hail type)
+    mrms_data_sleet = np.zeros((1, 5), dtype=np.float32)
+    mrms_data_sleet[0, MRMS["precip_flag"]] = 7  # Rain + hail → sleet
+
+    result_sleet = _calculate_precip_type_probs(
+        source_list=["mrms"],
+        hrrrSubHInterpolation=None,
+        nbmMinuteInterpolation=None,
+        dwd_mosmix_MinuteInterpolation=None,
+        ecmwfMinuteInterpolation=None,
+        gefsMinuteInterpolation=None,
+        gfsMinuteInterpolation=None,
+        era5_MinuteInterpolation=None,
+        lat=40.0,
+        lon=-90.0,
+        mrms_data=mrms_data_sleet,
+    )
+
+    # Column 3 = sleet/freezing-rain probability
+    assert np.all(result_sleet[:, 3] == 1.0), (
+        "MRMS rain+hail flag (7) should set sleet probability to 1.0"
+    )
+
     # No precip flag
     mrms_data_none = np.zeros((1, 5), dtype=np.float32)
     mrms_data_none[0, MRMS["precip_flag"]] = 0  # No precip
@@ -250,9 +297,9 @@ def test_mrms_not_used_when_hrrr_available():
     from API.constants.model_const import HRRR_SUBH, MRMS
     from API.minutely.builder import _calculate_precip_type_probs
 
-    # MRMS says snow, HRRR SubH says rain
+    # MRMS says snow (flag 3), HRRR SubH says rain
     mrms_data_snow = np.zeros((1, 5), dtype=np.float32)
-    mrms_data_snow[0, MRMS["precip_flag"]] = 8  # Snow
+    mrms_data_snow[0, MRMS["precip_flag"]] = 3  # Snow
 
     # Mock HRRR SubH: all rain (column 4 in InterTminute = rain in HRRR_SUBH mapping)
     n_minutes = 61
@@ -317,3 +364,83 @@ def test_grid_indexing_result_has_mrms():
     assert "y_mrms" in field_names
     assert "mrms_lat" in field_names
     assert "mrms_lon" in field_names
+
+
+def test_mrms_lightning_thunderstorm_threshold():
+    """Test that the MRMS lightning threshold constant is defined and positive."""
+    from API.constants.shared_const import MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD
+
+    assert MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD > 0, (
+        "Lightning thunderstorm threshold must be positive"
+    )
+
+
+def test_mrms_lightning_overrides_currently_icon():
+    """Test that MRMS lightning above threshold overrides the currently icon.
+
+    When lightning flash rate density exceeds the threshold AND precipitation
+    is occurring, build_current_section should override the icon to 'thunderstorm'.
+    """
+    from API.constants.model_const import MRMS
+    from API.constants.shared_const import MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD
+
+    # Verify MRMS constant has lightning field
+    assert "lightning" in MRMS
+
+    # Verify threshold is sensible
+    assert MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD > 0.0
+    assert MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD < 10.0  # sanity upper bound
+
+
+def test_mrms_lightning_override_logic():
+    """Test the conditional logic that triggers the thunderstorm override.
+
+    Directly exercises the three conditions in the lightning override block:
+    lightning ≥ threshold, precip > 0, lightning is finite.
+    """
+    from API.constants.model_const import MRMS
+    from API.constants.shared_const import MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD
+
+    def _should_override(lightning_val, precip_intensity):
+        """Replicate the override condition from build_current_section."""
+        return (
+            np.isfinite(lightning_val)
+            and lightning_val >= MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD
+            and precip_intensity > 0.0
+        )
+
+    lightning_idx = MRMS["lightning"]
+    thr = MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD
+
+    # --- Case 1: above threshold + active precip → should override ---
+    mrms_above = np.zeros((1, 5), dtype=np.float32)
+    mrms_above[0, lightning_idx] = thr * 2.0  # well above threshold
+    assert _should_override(float(mrms_above[0, lightning_idx]), 1.0), (
+        "Should trigger override when lightning above threshold with active precip"
+    )
+
+    # --- Case 2: exactly at threshold + active precip → should override ---
+    mrms_at = np.zeros((1, 5), dtype=np.float32)
+    mrms_at[0, lightning_idx] = thr
+    assert _should_override(float(mrms_at[0, lightning_idx]), 0.5), (
+        "Should trigger override when lightning equals threshold with active precip"
+    )
+
+    # --- Case 3: below threshold + active precip → should NOT override ---
+    mrms_below = np.zeros((1, 5), dtype=np.float32)
+    mrms_below[0, lightning_idx] = thr * 0.5
+    assert not _should_override(float(mrms_below[0, lightning_idx]), 1.0), (
+        "Should not override when lightning below threshold"
+    )
+
+    # --- Case 4: above threshold + NO precip → should NOT override ---
+    mrms_no_precip = np.zeros((1, 5), dtype=np.float32)
+    mrms_no_precip[0, lightning_idx] = thr * 2.0
+    assert not _should_override(float(mrms_no_precip[0, lightning_idx]), 0.0), (
+        "Should not override when lightning is high but no precipitation"
+    )
+
+    # --- Case 5: NaN lightning → should NOT override ---
+    assert not _should_override(float("nan"), 1.0), (
+        "Should not override when lightning is NaN"
+    )

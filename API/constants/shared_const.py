@@ -26,3 +26,7 @@ HISTORY_PERIODS = {
     "NBM_Fire": 48,
     "DWD_MOSMIX": 48,  # History period offset (like other models)
 }
+
+# MRMS lightning flash rate density threshold (flashes/km²/min) for thunderstorm detection.
+# Any value at or above this threshold combined with active precipitation indicates a thunderstorm.
+MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD = 0.1

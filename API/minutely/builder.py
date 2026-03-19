@@ -420,18 +420,20 @@ def _calculate_precip_type_probs(
         return InterTminute
 
     # MRMS fallback: use when HRRR SubH and NBM are unavailable.
-    # MRMS provides rain/snow/hail observations from the current radar scan.
+    # MRMS provides rain/snow/sleet observations from the current radar scan.
     # Per the data-source guidelines, MRMS type is used only when no HRRR type
-    # is available. Hail is treated as rain for the probability columns since
-    # the minutely type array has no separate hail category.
+    # is available. Flag 7 (rain+hail) maps to sleet since the API has no
+    # dedicated hail category.
     if "mrms" in source_list and mrms_data is not None:
         try:
             mrms_flag = int(mrms_data[0, MRMS["precip_flag"]])
             mrms_ptype = map_mrms_flag_to_ptype(mrms_flag)
             if mrms_ptype == "snow":
                 InterTminute[:, 1] = 1.0  # snow column
-            elif mrms_ptype in ("rain", "hail"):
-                InterTminute[:, 4] = 1.0  # rain column (hail maps to rain here)
+            elif mrms_ptype == "sleet":
+                InterTminute[:, 3] = 1.0  # sleet column
+            elif mrms_ptype == "rain":
+                InterTminute[:, 4] = 1.0  # rain column
             # "none" → all columns stay 0
             return InterTminute
         except (IndexError, TypeError, ValueError):
@@ -568,12 +570,22 @@ def _calculate_intensity(
             + era5_MinuteInterpolation[:, ERA5["convective_rain_rate"]]
         ) * 3600
 
-    # MRMS nowcasting: blend MRMS observed rate with model forecast.
-    # MRMS is valid only for the current moment, so we use it as an anchor
-    # at t=0 and decay its weight linearly to zero over MRMS_NOWCAST_WINDOW seconds.
-    # This provides a smooth transition from the observed current precipitation
-    # rate to the model forecast.
-    _MRMS_NOWCAST_WINDOW_S = 15 * 60  # 15 minutes in seconds
+    # MRMS nowcasting: Lagrangian persistence + linear blend to model forecast.
+    #
+    # MRMS provides the observed precipitation rate at the moment of the last
+    # radar scan.  A zero-order Lagrangian persistence nowcast holds that rate
+    # constant for a short window, then smoothly hands off to the model.
+    #
+    # Timeline (seconds from MRMS scan time):
+    #   0 – MRMS_PERSISTENCE_S        : pure MRMS rate (persistence)
+    #   MRMS_PERSISTENCE_S – MRMS_PERSISTENCE_S+MRMS_BLEND_S : linear blend
+    #   > MRMS_PERSISTENCE_S+MRMS_BLEND_S : pure model forecast
+    #
+    # When no model forecast is available the rate is held at the MRMS value for
+    # the persistence window and then linearly fades to zero across the blend
+    # window.  This is much more sensible than decaying immediately to zero.
+    _MRMS_PERSISTENCE_S = 30 * 60  # 30 minutes of pure persistence
+    _MRMS_BLEND_S = 30 * 60  # 30 minutes of blending to model
     if (
         "mrms" in source_list
         and mrms_data is not None
@@ -584,13 +596,20 @@ def _calculate_intensity(
             mrms_rate = float(mrms_data[0, MRMS["precip_rate"]])
             if np.isfinite(mrms_rate) and np.isfinite(mrms_time):
                 dt = minute_array_grib - mrms_time
-                alpha = np.clip(dt / _MRMS_NOWCAST_WINDOW_S, 0.0, 1.0)
-                # Use isnan to correctly detect MISSING_DATA (which is np.nan)
+                # alpha: 0 = full MRMS, 1 = full model
+                alpha = np.clip(
+                    (dt - _MRMS_PERSISTENCE_S) / _MRMS_BLEND_S, 0.0, 1.0
+                )
                 valid_intensity_mask = ~np.isnan(intensity)
+                # Fade coefficient when no model data (falls to 0 at end of
+                # blend window rather than immediately)
+                fallback_alpha = np.clip(
+                    (dt - _MRMS_PERSISTENCE_S) / _MRMS_BLEND_S, 0.0, 1.0
+                )
                 blended = np.where(
                     valid_intensity_mask,
                     mrms_rate * (1.0 - alpha) + intensity * alpha,
-                    mrms_rate * np.maximum(1.0 - alpha, 0.0),
+                    mrms_rate * (1.0 - fallback_alpha),
                 )
                 intensity = blended
         except (IndexError, TypeError, ValueError):

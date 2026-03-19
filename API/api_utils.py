@@ -455,40 +455,34 @@ def map_mrms_flag_to_ptype(flag_value: int) -> str:
     """
     Map a single MRMS PrecipFlag code to an internal precipitation type string.
 
-    MRMS PrecipFlag codes and their meanings:
-        0:  No precipitation
-        1:  Rain (RA)
-        2:  Hail (HA)
-        3:  Big Drops / heavy rain (BD)
-        4:  Rain + Hail mixture (RH)
-        5:  Rain + Hail (RH2)
-        6:  Cold-Striated DSD
-        7:  Graupel/Small Hail (GR) – mapped to snow as closest frozen type
-        8:  Snow (SN)
-        9:  Dry Snow
-        10: Wet Snow
-        11: Ice Crystals
-        12: Drizzle (DZ)
-        91: Tropical (rain)
-        96: Biological echo – not real precipitation
-
-    Since MRMS effectively provides rain/snow/hail, unknown codes default to rain.
+    MRMS PrecipFlag codes and their meanings (from NOAA MRMS UserTable_MRMS_PrecipFlags.csv):
+        -3:  No coverage (no radar data)
+        0:   No precipitation
+        1:   Warm stratiform rain
+        3:   Snow
+        6:   Convective rain
+        7:   Rain mixed with hail → mapped to "sleet" (no hail category in the API)
+        10:  Cold stratiform rain
+        91:  Tropical/stratiform rain mix
+        96:  Tropical/convective rain mix
+        Other codes default to "none" (conservative – do not emit unknown precipitation).
 
     Args:
         flag_value: A single integer MRMS PrecipFlag code.
 
     Returns:
-        One of the internal precip type strings: "none", "rain", "snow", "hail".
+        One of the internal precip type strings: "none", "rain", "snow", "sleet".
     """
     flag = int(flag_value)
-    if flag == 0 or flag == 96:
-        return "none"
-    if flag in (2, 4, 5):
-        return "hail"
-    if flag in (7, 8, 9, 10, 11):
+    if flag in (1, 6, 10, 91, 96):
+        return "rain"
+    if flag == 3:
         return "snow"
-    # 1 (rain), 3 (big drops), 6, 12 (drizzle), 91 (tropical) and any others
-    return "rain"
+    if flag == 7:
+        # Rain mixed with hail; the API has no dedicated hail type, so use sleet
+        return "sleet"
+    # -3 (no coverage), 0 (no precip), and any other unmapped code
+    return "none"
 
 
 def zero_small_values(

@@ -984,6 +984,7 @@ async def PW_Forecast(
             logger=logger,
             loc_tag=loc_tag,
             include_currently=exCurrently != 1,
+            mrms_data=dataOut_mrms if isinstance(dataOut_mrms, np.ndarray) else None,
         )
     ### RETURN ###
     # 16. Construct and return the final JSON response

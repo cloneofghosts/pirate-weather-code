@@ -41,11 +41,15 @@ from API.constants.model_const import (
     GFS,
     HRRR,
     HRRR_SUBH,
+    MRMS,
     NBM,
     NBM_FIRE_INDEX,
     RTMA_RU,
 )
-from API.constants.shared_const import MISSING_DATA
+from API.constants.shared_const import (
+    MISSING_DATA,
+    MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD,
+)
 from API.legacy.current import get_legacy_current_summary
 from API.PirateText import calculate_text
 from API.PirateTextHelper import estimate_snow_height
@@ -1272,6 +1276,7 @@ def build_current_section(
     loc_tag: str,
     log_timing: Optional[Callable[[str], None]] = None,
     include_currently: bool = True,
+    mrms_data=None,
 ) -> CurrentSection:
     """
     Calculate the currently block and return it alongside the raw array.
@@ -1322,6 +1327,8 @@ def build_current_section(
         loc_tag: Location tag.
         log_timing: Optional timing logger.
         include_currently: Whether to include the currently block.
+        mrms_data: Optional MRMS single-timestep data array (shape (1, 5)).
+            Used to detect active thunderstorms via lightning flash rate density.
 
     Returns:
         CurrentSection object containing the current forecast.
@@ -1614,6 +1621,29 @@ def build_current_section(
                 currently["icon"] = currentIcon
         except Exception:
             logger.exception("CURRENTLY TEXT GEN ERROR %s", loc_tag)
+
+    # MRMS lightning-based thunderstorm override.
+    # If the MRMS lightning flash rate density exceeds the threshold and
+    # precipitation is currently occurring, override the icon (and summary if
+    # enabled) to indicate a thunderstorm.  This is direct observational
+    # evidence that takes precedence over CAPE-based inference.
+    if include_currently and mrms_data is not None:
+        try:
+            lightning_density = float(mrms_data[0, MRMS["lightning"]])
+            precip_now = float(minuteItems[0]["precipIntensity"]) if minuteItems else 0.0
+            if (
+                np.isfinite(lightning_density)
+                and lightning_density >= MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD
+                and precip_now > 0.0
+            ):
+                currently["icon"] = "thunderstorm"
+                current_summary_key = "thunderstorm"
+                if summaryText:
+                    currently["summary"] = translation.translate(
+                        ["title", "thunderstorm"]
+                    )
+        except (IndexError, TypeError, ValueError):
+            pass
 
     return CurrentSection(
         currently=currently,
