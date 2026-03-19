@@ -282,6 +282,7 @@ def test_dwd_mosmix_invalid_timestamp_not_in_source_list():
         dataOut_gefs=False,
         dataOut_rtma_ru=False,
         dataOut_dwd_mosmix=False,  # Set to False when timestamp is invalid
+        dataOut_mrms=False,
         era5_merged=False,
         subhRunTime=None,
         hrrrhRunTime=None,
@@ -312,6 +313,10 @@ def test_dwd_mosmix_invalid_timestamp_not_in_source_list():
         y_dwd=None,
         dwd_lat=None,
         dwd_lon=None,
+        x_mrms=None,
+        y_mrms=None,
+        mrms_lat=None,
+        mrms_lon=None,
         sourceIDX={},
         WMO_alertDat=None,
     )
@@ -352,6 +357,7 @@ def test_dwd_mosmix_valid_timestamp_in_source_list():
         dataOut_gefs=False,
         dataOut_rtma_ru=False,
         dataOut_dwd_mosmix=np.array([[1.0, 2.0, 3.0]]),  # Has data
+        dataOut_mrms=False,
         era5_merged=False,
         subhRunTime=None,
         hrrrhRunTime=None,
@@ -382,6 +388,10 @@ def test_dwd_mosmix_valid_timestamp_in_source_list():
         y_dwd=None,
         dwd_lat=None,
         dwd_lon=None,
+        x_mrms=None,
+        y_mrms=None,
+        mrms_lat=None,
+        mrms_lon=None,
         sourceIDX={},
         WMO_alertDat=None,
     )

@@ -451,6 +451,46 @@ def map_wmo4677_to_ptype(
     return out
 
 
+def map_mrms_flag_to_ptype(flag_value: int) -> str:
+    """
+    Map a single MRMS PrecipFlag code to an internal precipitation type string.
+
+    MRMS PrecipFlag codes and their meanings:
+        0:  No precipitation
+        1:  Rain (RA)
+        2:  Hail (HA)
+        3:  Big Drops / heavy rain (BD)
+        4:  Rain + Hail mixture (RH)
+        5:  Rain + Hail (RH2)
+        6:  Cold-Striated DSD
+        7:  Graupel/Small Hail (GR) – mapped to snow as closest frozen type
+        8:  Snow (SN)
+        9:  Dry Snow
+        10: Wet Snow
+        11: Ice Crystals
+        12: Drizzle (DZ)
+        91: Tropical (rain)
+        96: Biological echo – not real precipitation
+
+    Since MRMS effectively provides rain/snow/hail, unknown codes default to rain.
+
+    Args:
+        flag_value: A single integer MRMS PrecipFlag code.
+
+    Returns:
+        One of the internal precip type strings: "none", "rain", "snow", "hail".
+    """
+    flag = int(flag_value)
+    if flag == 0 or flag == 96:
+        return "none"
+    if flag in (2, 4, 5):
+        return "hail"
+    if flag in (7, 8, 9, 10, 11):
+        return "snow"
+    # 1 (rain), 3 (big drops), 6, 12 (drizzle), 91 (tropical) and any others
+    return "rain"
+
+
 def zero_small_values(
     array: np.ndarray, threshold: float = PRECIP_NOISE_THRESHOLD_MMH
 ) -> np.ndarray:

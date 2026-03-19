@@ -17,6 +17,11 @@ from API.constants.grid_const import (
     HRRR_X_MIN,
     HRRR_Y_MAX,
     HRRR_Y_MIN,
+    MRMS_DELTA,
+    MRMS_LAT_MAX,
+    MRMS_LAT_MIN,
+    MRMS_LON_MAX,
+    MRMS_LON_MIN,
     NBM_X_MAX,
     NBM_X_MIN,
     NBM_Y_MAX,
@@ -53,6 +58,7 @@ class ZarrSources:
     wmo_alerts: Any
     era5_data: Any
     dwd_mosmix: Any = None
+    mrms: Any = None
 
 
 @dataclass
@@ -67,6 +73,7 @@ class GridIndexingResult:
     dataOut_gefs: Union[np.ndarray, bool]
     dataOut_rtma_ru: Union[np.ndarray, bool]
     dataOut_dwd_mosmix: Union[np.ndarray, bool]
+    dataOut_mrms: Union[np.ndarray, bool]
     era5_merged: Union[np.ndarray, bool]
     subhRunTime: Union[float, None]
     hrrrhRunTime: Union[float, None]
@@ -97,6 +104,10 @@ class GridIndexingResult:
     y_dwd: Union[float, None]
     dwd_lat: Union[float, None]
     dwd_lon: Union[float, None]
+    x_mrms: Union[int, None]
+    y_mrms: Union[int, None]
+    mrms_lat: Union[float, None]
+    mrms_lon: Union[float, None]
     sourceIDX: dict
     WMO_alertDat: Union[str, None]
 
@@ -116,6 +127,7 @@ async def calculate_grid_indexing(
     ex_gefs: int,
     ex_rtma_ru: int,
     ex_dwd_mosmix: int,
+    ex_mrms: int,
     read_wmo_alerts: bool,
     base_day_utc: datetime.datetime,
     zarr_sources: ZarrSources,
@@ -135,6 +147,7 @@ async def calculate_grid_indexing(
     readHRRR = False
     readERA5 = False
     readDWD_MOSMIX = False
+    readMRMS = False
 
     def _get_grid_coords(
         lat,
@@ -382,6 +395,40 @@ async def calculate_grid_indexing(
 
     timer.log("### DWD MOSMIX Detail END ###")
 
+    timer.log("### MRMS Detail Start ###")
+
+    # MRMS (Multi-Radar/Multi-Sensor) – regular lat/lon grid covering CONUS.
+    # Only valid for the current time (no time-machine support) and when the
+    # location falls within the MRMS CONUS domain.
+    dataOut_mrms = False
+    x_mrms = None
+    y_mrms = None
+    mrms_lat = None
+    mrms_lon = None
+    if ex_mrms == 1:
+        dataOut_mrms = False
+    elif time_machine:
+        dataOut_mrms = False
+    elif zarr_sources.mrms is None:
+        dataOut_mrms = False
+    elif (
+        lat < MRMS_LAT_MIN
+        or lat > MRMS_LAT_MAX
+        or az_lon < MRMS_LON_MIN
+        or az_lon > MRMS_LON_MAX
+    ):
+        dataOut_mrms = False
+    else:
+        mrms_lats = np.arange(MRMS_LAT_MIN, MRMS_LAT_MAX + MRMS_DELTA / 2, MRMS_DELTA)
+        mrms_lons = np.arange(MRMS_LON_MIN, MRMS_LON_MAX + MRMS_DELTA / 2, MRMS_DELTA)
+        y_mrms = int(np.argmin(np.abs(mrms_lats - lat)))
+        x_mrms = int(np.argmin(np.abs(mrms_lons - az_lon)))
+        mrms_lat = float(mrms_lats[y_mrms])
+        mrms_lon = float(mrms_lons[x_mrms])
+        readMRMS = True
+
+    timer.log("### MRMS Detail END ###")
+
     if readERA5:
         abslat_era5 = np.abs(zarr_sources.era5_data["ERA5_lats"] - lat)
         abslon_era5 = np.abs(zarr_sources.era5_data["ERA5_lons"] - lon)
@@ -443,6 +490,8 @@ async def calculate_grid_indexing(
         zarrTasks["DWD_MOSMIX"] = weather.zarr_read(
             "DWD_MOSMIX", zarr_sources.dwd_mosmix, x_dwd, y_dwd
         )
+    if readMRMS:
+        zarrTasks["MRMS"] = weather.zarr_read("MRMS", zarr_sources.mrms, x_mrms, y_mrms)
 
     WMO_alertDat = None
     if read_wmo_alerts:
@@ -617,6 +666,31 @@ async def calculate_grid_indexing(
     else:
         dataOut_rtma_ru = False
 
+    if readMRMS:
+        dataOut_mrms = zarr_results["MRMS"]
+        if dataOut_mrms is not False:
+            mrms_time_val = dataOut_mrms[0, 0]
+            try:
+                mrms_timestamp_dt = datetime.datetime.fromtimestamp(
+                    int(mrms_time_val), datetime.UTC
+                ).replace(tzinfo=None)
+                # Exclude MRMS data older than 15 minutes
+                if (utc_time - mrms_timestamp_dt) > datetime.timedelta(minutes=15):
+                    dataOut_mrms = False
+                    logger.warning("OLD MRMS")
+                else:
+                    sourceIDX["mrms"] = {
+                        "x": x_mrms,
+                        "y": y_mrms,
+                        "lat": round(mrms_lat, 3),
+                        "lon": round(mrms_lon, 3),
+                    }
+            except (ValueError, TypeError, AttributeError):
+                dataOut_mrms = False
+                logger.debug("Failed to parse MRMS timestamp")
+    else:
+        dataOut_mrms = False
+
     if readDWD_MOSMIX:
         dataOut_dwd_mosmix = zarr_results["DWD_MOSMIX"]
         if dataOut_dwd_mosmix is not False:
@@ -685,6 +759,7 @@ async def calculate_grid_indexing(
         dataOut_gefs=dataOut_gefs,
         dataOut_rtma_ru=dataOut_rtma_ru,
         dataOut_dwd_mosmix=dataOut_dwd_mosmix,
+        dataOut_mrms=dataOut_mrms,
         era5_merged=ERA5_MERGED,
         subhRunTime=subhRunTime,
         hrrrhRunTime=hrrrhRunTime,
@@ -715,6 +790,10 @@ async def calculate_grid_indexing(
         y_dwd=y_dwd,
         dwd_lat=dwd_lat,
         dwd_lon=dwd_lon,
+        x_mrms=x_mrms,
+        y_mrms=y_mrms,
+        mrms_lat=mrms_lat,
+        mrms_lon=mrms_lon,
         sourceIDX=sourceIDX,
         WMO_alertDat=WMO_alertDat,
     )

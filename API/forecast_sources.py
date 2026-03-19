@@ -122,6 +122,13 @@ def build_source_metadata(
             "lon": round(((float(grid_result.rtma_lon) + 180) % 360) - 180, 2),
         }
 
+    if isinstance(grid_result.dataOut_mrms, np.ndarray) and not time_machine:
+        mrms_time_val = grid_result.dataOut_mrms[0, 0]
+        mrms_timestamp = datetime.datetime.fromtimestamp(
+            int(mrms_time_val), datetime.UTC
+        ).replace(tzinfo=None)
+        metadata.add("mrms", time_value=mrms_timestamp.strftime("%Y-%m-%d %H:%MZ"))
+
     if isinstance(grid_result.dataOut_hrrrh, np.ndarray):
         if not time_machine:
             metadata.add(

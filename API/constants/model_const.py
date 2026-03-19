@@ -129,6 +129,16 @@ RTMA_RU = {
     "wind_v": 9,
 }
 
+# MRMS (Multi-Radar/Multi-Sensor) variable indices
+# These match the zarr_vars order in MRMS_Local_Ingest.py:
+# time, precip_rate, precip_flag, refl_1km, lightning
+MRMS = {
+    "precip_rate": 1,  # Surface precipitation rate (mm/hr)
+    "precip_flag": 2,  # Precipitation type flag (0=none,1=rain,2=hail,8=snow; see map_mrms_flag_to_ptype)
+    "refl_1km": 3,     # Reflectivity at 1 km above MSL (dBZ)
+    "lightning": 4,    # Lightning flash rate density (flashes/km²/min)
+}
+
 ERA5 = {
     "instantaneous_10m_wind_gust": 1,
     "mean_sea_level_pressure": 2,

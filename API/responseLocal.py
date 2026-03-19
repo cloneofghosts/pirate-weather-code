@@ -134,6 +134,7 @@ RTMA_RU_Zarr = None
 ERA5_Data = None
 DWD_MOSMIX_Zarr = None
 DWD_MOSMIX_Stations = None
+MRMS_Zarr = None
 
 
 setup_logging()
@@ -178,6 +179,7 @@ WMO_Alerts_Zarr = zarr_stores.WMO_Alerts_Zarr
 RTMA_RU_Zarr = zarr_stores.RTMA_RU_Zarr
 ERA5_Data = zarr_stores.ERA5_Data
 DWD_MOSMIX_Zarr = zarr_stores.DWD_MOSMIX_Zarr
+MRMS_Zarr = zarr_stores.MRMS_Zarr
 
 # Load DWD MOSMIX station mapping
 try:
@@ -354,6 +356,7 @@ async def PW_Forecast(
     global ERA5_Data
     global DWD_MOSMIX_Zarr
     global DWD_MOSMIX_Stations
+    global MRMS_Zarr
 
     # Timing Check
     T_Start = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
@@ -410,6 +413,7 @@ async def PW_Forecast(
     exGEFS = initial.ex_gefs
     exGFS = initial.ex_gfs
     exRTMA_RU = initial.ex_rtma_ru
+    exMRMS = initial.ex_mrms
     exECMWF = initial.ex_ecmwf
     exDWD_MOSMIX = initial.ex_dwd_mosmix
     inc_day_night = initial.inc_day_night
@@ -466,6 +470,7 @@ async def PW_Forecast(
         wmo_alerts=WMO_Alerts_Zarr,
         era5_data=ERA5_Data,
         dwd_mosmix=DWD_MOSMIX_Zarr,
+        mrms=MRMS_Zarr,
     )
 
     # 3. Calculate grid indices for the requested location to retrieve data from Zarr stores
@@ -485,6 +490,7 @@ async def PW_Forecast(
         ex_gefs=exGEFS,
         ex_rtma_ru=exRTMA_RU,
         ex_dwd_mosmix=exDWD_MOSMIX,
+        ex_mrms=exMRMS,
         read_wmo_alerts=readWMOAlerts,
         base_day_utc=baseDayUTC,
         zarr_sources=zarr_sources,
@@ -504,6 +510,7 @@ async def PW_Forecast(
     dataOut_gefs = grid_result.dataOut_gefs
     dataOut_rtma_ru = grid_result.dataOut_rtma_ru
     dataOut_dwd_mosmix = grid_result.dataOut_dwd_mosmix
+    dataOut_mrms = grid_result.dataOut_mrms
     WMO_alertDat = grid_result.WMO_alertDat
 
     ERA5_MERGED = grid_result.era5_merged
@@ -644,6 +651,7 @@ async def PW_Forecast(
             gfs_data=dataOut_gfs if "gfs" in sourceList else None,
             ecmwf_data=dataOut_ecmwf if "ecmwf_ifs" in sourceList else None,
             era5_data=ERA5_MERGED if isinstance(ERA5_MERGED, np.ndarray) else None,
+            mrms_data=dataOut_mrms if isinstance(dataOut_mrms, np.ndarray) else None,
             prep_intensity_unit=prepIntensityUnit,
             version=version,
             lat=lat,

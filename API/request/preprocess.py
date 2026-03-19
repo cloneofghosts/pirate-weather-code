@@ -118,6 +118,7 @@ class InitialRequestContext:
     ex_gefs: int
     ex_gfs: int
     ex_rtma_ru: int
+    ex_mrms: int
     ex_ecmwf: int
     ex_dwd_mosmix: int
     inc_day_night: int
@@ -343,6 +344,7 @@ def _parse_parameters(
     ex_gefs = int("gefs" in exclude_params)
     ex_gfs = int("gfs" in exclude_params)
     ex_rtma_ru = int("rtma_ru" in exclude_params)
+    ex_mrms = int("mrms" in exclude_params)
     ex_ecmwf = int("ecmwf_ifs" in exclude_params)
     ex_dwd_mosmix = int("dwd_mosmix" in exclude_params)
     summary_text = "summary" not in exclude_params
@@ -354,6 +356,7 @@ def _parse_parameters(
         ex_hrrr = 1
         ex_gefs = 1
         ex_rtma_ru = 1
+        ex_mrms = 1
         ex_ecmwf = 1
         ex_dwd_mosmix = 1
 
@@ -364,6 +367,7 @@ def _parse_parameters(
     if time_machine:
         ex_alerts = 1
         ex_dwd_mosmix = 1
+        ex_mrms = 1
 
     return (
         exclude_params,
@@ -380,6 +384,7 @@ def _parse_parameters(
         ex_gefs,
         ex_gfs,
         ex_rtma_ru,
+        ex_mrms,
         ex_ecmwf,
         ex_dwd_mosmix,
         summary_text,
@@ -561,6 +566,7 @@ async def prepare_initial_request(
         ex_gefs,
         ex_gfs,
         ex_rtma_ru,
+        ex_mrms,
         ex_ecmwf,
         ex_dwd_mosmix,
         summary_text,
@@ -674,6 +680,7 @@ async def prepare_initial_request(
         ex_gefs=ex_gefs,
         ex_gfs=ex_gfs,
         ex_rtma_ru=ex_rtma_ru,
+        ex_mrms=ex_mrms,
         ex_ecmwf=ex_ecmwf,
         ex_dwd_mosmix=ex_dwd_mosmix,
         inc_day_night=inc_day_night,

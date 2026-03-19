@@ -8,6 +8,7 @@ import numpy as np
 
 from API.api_utils import (
     fast_nearest_interp,
+    map_mrms_flag_to_ptype,
     map_wmo4677_to_ptype,
     zero_small_values,
 )
@@ -28,6 +29,7 @@ from API.constants.model_const import (
     GFS,
     HRRR,
     HRRR_SUBH,
+    MRMS,
     NBM,
 )
 from API.constants.shared_const import MISSING_DATA
@@ -376,6 +378,7 @@ def _calculate_precip_type_probs(
     era5_MinuteInterpolation,
     lat,
     lon,
+    mrms_data=None,
 ):
     """
     Calculate precipitation type probabilities.
@@ -391,6 +394,7 @@ def _calculate_precip_type_probs(
         era5_MinuteInterpolation: ERA5 interpolated data.
         lat: Latitude of the location.
         lon: Longitude of the location.
+        mrms_data: MRMS single-timestep data array (optional).
 
     Returns:
         Array of precipitation type probabilities.
@@ -414,6 +418,24 @@ def _calculate_precip_type_probs(
         InterTminute[:, 3] = nbmMinuteInterpolation[:, NBM["freezing_rain"]]
         InterTminute[:, 4] = nbmMinuteInterpolation[:, NBM["rain"]]
         return InterTminute
+
+    # MRMS fallback: use when HRRR SubH and NBM are unavailable.
+    # MRMS provides rain/snow/hail observations from the current radar scan.
+    # Per the data-source guidelines, MRMS type is used only when no HRRR type
+    # is available. Hail is treated as rain for the probability columns since
+    # the minutely type array has no separate hail category.
+    if "mrms" in source_list and mrms_data is not None:
+        try:
+            mrms_flag = int(mrms_data[0, MRMS["precip_flag"]])
+            mrms_ptype = map_mrms_flag_to_ptype(mrms_flag)
+            if mrms_ptype == "snow":
+                InterTminute[:, 1] = 1.0  # snow column
+            elif mrms_ptype in ("rain", "hail"):
+                InterTminute[:, 4] = 1.0  # rain column (hail maps to rain here)
+            # "none" → all columns stay 0
+            return InterTminute
+        except (IndexError, TypeError, ValueError):
+            pass
 
     # Determine priority order based on location
     # In North America: ECMWF > GFS > DWD MOSMIX > GEFS > ERA5
@@ -469,6 +491,8 @@ def _calculate_intensity(
     gefsMinuteInterpolation,
     gfsMinuteInterpolation,
     era5_MinuteInterpolation,
+    mrms_data=None,
+    minute_array_grib=None,
 ):
     """
     Calculate precipitation intensity.
@@ -483,6 +507,8 @@ def _calculate_intensity(
         gefsMinuteInterpolation: GEFS interpolated data.
         gfsMinuteInterpolation: GFS interpolated data.
         era5_MinuteInterpolation: ERA5 interpolated data.
+        mrms_data: MRMS single-timestep data array (optional).
+        minute_array_grib: Minutely UNIX timestamps (optional, needed for MRMS blending).
 
     Returns:
         Tuple containing intensity array and updated precipitation types.
@@ -541,6 +567,34 @@ def _calculate_intensity(
             + era5_MinuteInterpolation[:, ERA5["large_scale_rain_rate"]]
             + era5_MinuteInterpolation[:, ERA5["convective_rain_rate"]]
         ) * 3600
+
+    # MRMS nowcasting: blend MRMS observed rate with model forecast.
+    # MRMS is valid only for the current moment, so we use it as an anchor
+    # at t=0 and decay its weight linearly to zero over MRMS_NOWCAST_WINDOW seconds.
+    # This provides a smooth transition from the observed current precipitation
+    # rate to the model forecast.
+    _MRMS_NOWCAST_WINDOW_S = 15 * 60  # 15 minutes in seconds
+    if (
+        "mrms" in source_list
+        and mrms_data is not None
+        and minute_array_grib is not None
+    ):
+        try:
+            mrms_time = float(mrms_data[0, 0])
+            mrms_rate = float(mrms_data[0, MRMS["precip_rate"]])
+            if np.isfinite(mrms_rate) and np.isfinite(mrms_time):
+                dt = minute_array_grib - mrms_time
+                alpha = np.clip(dt / _MRMS_NOWCAST_WINDOW_S, 0.0, 1.0)
+                # Use isnan to correctly detect MISSING_DATA (which is np.nan)
+                valid_intensity_mask = ~np.isnan(intensity)
+                blended = np.where(
+                    valid_intensity_mask,
+                    mrms_rate * (1.0 - alpha) + intensity * alpha,
+                    mrms_rate * np.maximum(1.0 - alpha, 0.0),
+                )
+                intensity = blended
+        except (IndexError, TypeError, ValueError):
+            pass
 
     return intensity, precipTypes, refc_used
 
@@ -700,6 +754,7 @@ def build_minutely_block(
     gfs_data: Optional[np.ndarray],
     ecmwf_data: Optional[np.ndarray],
     era5_data: Optional[np.ndarray],
+    mrms_data: Optional[np.ndarray] = None,
     prep_intensity_unit: float,
     version: float,
     lat: float,
@@ -732,6 +787,9 @@ def build_minutely_block(
         gfs_data: GFS data.
         ecmwf_data: ECMWF data.
         era5_data: ERA5 data.
+        mrms_data: MRMS single-timestep data (optional). Used as a nowcasting
+            anchor for precipitation intensity and as a fallback precipitation
+            type source when HRRR is unavailable.
         prep_intensity_unit: Precipitation intensity unit.
         version: API version.
         lat: Latitude of the location.
@@ -810,6 +868,7 @@ def build_minutely_block(
         era5_MinuteInterpolation,
         lat,
         lon,
+        mrms_data=mrms_data,
     )
 
     maxPchance = (
@@ -862,6 +921,8 @@ def build_minutely_block(
         gefsMinuteInterpolation,
         gfsMinuteInterpolation,
         era5_MinuteInterpolation,
+        mrms_data=mrms_data,
+        minute_array_grib=minute_array_grib,
     )
     InterPminute[:, DATA_MINUTELY["intensity"]] = intensity
 
