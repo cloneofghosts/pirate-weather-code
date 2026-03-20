@@ -131,13 +131,21 @@ RTMA_RU = {
 
 # MRMS (Multi-Radar/Multi-Sensor) variable indices
 # These match the zarr_vars order in MRMS_Local_Ingest.py:
-# time, precip_rate, precip_flag, refl_comp, lightning
+# time, precip_rate, precip_flag, refl_sfc, lightning, u_motion, v_motion
 MRMS = {
     "precip_rate": 1,  # Surface precipitation rate (mm/hr)
     "precip_flag": 2,  # Precipitation type flag; see map_mrms_flag_to_ptype
-    "refl_comp": 3,    # Composite (column-max) reflectivity (dBZ); full CONUS coverage
+    "refl_comp": 3,    # SeamlessHSR near-surface reflectivity (dBZ)
     "lightning": 4,    # Lightning flash rate density (flashes/km²/min)
+    "u_motion": 5,     # East–west motion (pixels/scan-interval, +east); pysteps LK
+    "v_motion": 6,     # North–south motion (pixels/scan-interval, pysteps row convention)
 }
+
+# Radius (pixels) of the precip-rate patch extracted around the query point for
+# the pysteps Lagrangian advection.  At the MRMS 1 km/pixel resolution this covers
+# a 200 km × 200 km neighbourhood, accommodating storm motions up to ~27 m/s over
+# the full 61-minute nowcast window.
+MRMS_PATCH_RADIUS = 100
 
 ERA5 = {
     "instantaneous_10m_wind_gust": 1,

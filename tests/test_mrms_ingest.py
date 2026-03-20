@@ -60,10 +60,16 @@ def test_mrms_script_has_required_components():
     assert "anon=True" in script_content, "Missing anonymous S3 access"
     assert "PrecipRate" in script_content, "Missing PrecipRate product"
     assert "PrecipFlag" in script_content, "Missing PrecipFlag product"
-    assert "MergedCompositeReflectivityQC" in script_content, "Missing composite reflectivity product"
+    assert "SeamlessHSR" in script_content, (
+        "Missing SeamlessHSR product (near-surface reflectivity; replaces composite)"
+    )
     assert "LightningFlashRateDensity" in script_content, "Missing LightningFlashRateDensity product"
     assert "gzip.decompress" in script_content, "Missing gzip decompression"
     assert "cfgrib" in script_content, "Missing cfgrib engine"
+    assert "pysteps" in script_content, "Missing pysteps import for motion estimation"
+    assert "u_motion" in script_content or "arr_u" in script_content, (
+        "Missing motion vector storage (u_motion / arr_u)"
+    )
 
 
 def test_mrms_constants_defined():
@@ -72,8 +78,10 @@ def test_mrms_constants_defined():
 
     assert "precip_rate" in MRMS, "MRMS missing precip_rate index"
     assert "precip_flag" in MRMS, "MRMS missing precip_flag index"
-    assert "refl_comp" in MRMS, "MRMS missing refl_comp index (composite reflectivity)"
+    assert "refl_comp" in MRMS, "MRMS missing refl_comp index (near-surface reflectivity)"
     assert "lightning" in MRMS, "MRMS missing lightning index"
+    assert "u_motion" in MRMS, "MRMS missing u_motion index (pysteps LK east–west)"
+    assert "v_motion" in MRMS, "MRMS missing v_motion index (pysteps LK north–south)"
     # Indices must be non-zero (variable index 0 in the zarr array is reserved for the
     # time variable; all other variables must use indices ≥ 1 to avoid collision)
     for key, idx in MRMS.items():
@@ -138,24 +146,25 @@ def test_map_mrms_flag_to_ptype():
 
 
 def test_mrms_nowcasting_blending():
-    """Test that MRMS nowcasting uses persistence then blends to model.
+    """Test that MRMS nowcasting blends from observed rate to model.
 
-    The improved algorithm:
-    - 0-30 min: pure MRMS rate (Lagrangian persistence)
-    - 30-60 min: linear blend from MRMS → model
-    - No-model fallback: hold rate for 30 min then fade to 0
+    When mrms_nowcast is None the algorithm falls back to zero-order persistence:
+    - 0–30 min: pure MRMS rate
+    - 30–60 min: linear blend MRMS → model (or fade to 0 when no model)
     """
     from API.constants.model_const import MRMS
     from API.minutely.builder import _calculate_intensity
 
-    # Create a fake mrms_data: shape (1, 5) => 1 time step, 5 variables
-    # time=0, precip_rate=5.0 mm/hr, precip_flag=1 (rain), refl_comp=35, lightning=0
-    mrms_data = np.zeros((1, 5), dtype=np.float32)
+    # Create a fake mrms_data: shape (1, 7) => 1 time step, 7 variables
+    # time=0, precip_rate=5.0 mm/hr, rest=0
+    mrms_data = np.zeros((1, 7), dtype=np.float32)
     mrms_data[0, 0] = 0.0       # UNIX timestamp = 0 (t=0)
     mrms_data[0, MRMS["precip_rate"]] = 5.0
     mrms_data[0, MRMS["precip_flag"]] = 1
     mrms_data[0, MRMS["refl_comp"]] = 35.0
     mrms_data[0, MRMS["lightning"]] = 0.0
+    mrms_data[0, MRMS["u_motion"]] = 0.0
+    mrms_data[0, MRMS["v_motion"]] = 0.0
 
     # 61 minutes starting at t=0, 1 minute apart
     minute_array_grib = np.arange(0, 61 * 60, 60, dtype=float)
@@ -177,6 +186,7 @@ def test_mrms_nowcasting_blending():
         era5_MinuteInterpolation=None,
         mrms_data=mrms_data,
         minute_array_grib=minute_array_grib,
+        mrms_nowcast=None,  # fallback persistence
     )
 
     # At t=0 (persistence window), intensity must equal MRMS rate
@@ -194,13 +204,79 @@ def test_mrms_nowcasting_blending():
     )
 
 
+def test_mrms_pysteps_nowcast_used_when_patch_available():
+    """Test that a pre-computed pysteps nowcast array replaces persistence.
+
+    When mrms_nowcast is provided to _calculate_intensity it should replace the
+    zero-order persistence fallback so that per-minute rates differ from the
+    scalar observed rate.
+    """
+    from API.constants.model_const import MRMS
+    from API.minutely.builder import _calculate_intensity
+
+    mrms_data = np.zeros((1, 7), dtype=np.float32)
+    mrms_data[0, 0] = 0.0
+    mrms_data[0, MRMS["precip_rate"]] = 5.0
+
+    minute_array_grib = np.arange(0, 61 * 60, 60, dtype=float)
+    precipTypes = np.array(["rain"] * 61, dtype="U5")
+
+    # Craft a nowcast that linearly increases from 5 to 10 mm/hr
+    mrms_nowcast = np.linspace(5.0, 10.0, 61, dtype=np.float32)
+
+    intensity, _, _ = _calculate_intensity(
+        source_list=["mrms"],
+        precipTypes=precipTypes,
+        hrrrSubHInterpolation=None,
+        nbmMinuteInterpolation=None,
+        dwd_mosmix_MinuteInterpolation=None,
+        ecmwfMinuteInterpolation=None,
+        gefsMinuteInterpolation=None,
+        gfsMinuteInterpolation=None,
+        era5_MinuteInterpolation=None,
+        mrms_data=mrms_data,
+        minute_array_grib=minute_array_grib,
+        mrms_nowcast=mrms_nowcast,
+    )
+
+    # At minute 0 (alpha=0) intensity should match the nowcast at step 0
+    assert intensity[0] == pytest.approx(mrms_nowcast[0], abs=0.1), (
+        f"Minute 0: expected nowcast {mrms_nowcast[0]} but got {intensity[0]}"
+    )
+    # At minute 15 (still in pure MRMS window) should match nowcast step 15
+    assert intensity[15] == pytest.approx(mrms_nowcast[15], abs=0.1), (
+        f"Minute 15: expected nowcast {mrms_nowcast[15]} but got {intensity[15]}"
+    )
+
+
+def test_mrms_patch_radius_constant_defined():
+    """Test that MRMS_PATCH_RADIUS is defined and sensible."""
+    from API.constants.model_const import MRMS_PATCH_RADIUS
+
+    assert isinstance(MRMS_PATCH_RADIUS, int), "MRMS_PATCH_RADIUS must be an int"
+    assert MRMS_PATCH_RADIUS >= 50, "MRMS_PATCH_RADIUS should be at least 50 pixels"
+    assert MRMS_PATCH_RADIUS <= 500, "MRMS_PATCH_RADIUS should be at most 500 pixels"
+
+
+def test_grid_indexing_result_has_mrms_patch_fields():
+    """Test that GridIndexingResult dataclass includes the MRMS patch fields."""
+    import dataclasses
+
+    from API.request.grid_indexing import GridIndexingResult
+
+    field_names = {f.name for f in dataclasses.fields(GridIndexingResult)}
+    assert "mrms_rate_patch" in field_names, "Missing mrms_rate_patch field"
+    assert "mrms_patch_cy" in field_names, "Missing mrms_patch_cy field"
+    assert "mrms_patch_cx" in field_names, "Missing mrms_patch_cx field"
+
+
 def test_mrms_ptype_fallback():
     """Test that MRMS precipitation type is used as fallback when HRRR/NBM unavailable."""
     from API.constants.model_const import MRMS
     from API.minutely.builder import _calculate_precip_type_probs
 
     # Snow flag (flag 3 per NOAA MRMS PrecipFlags table)
-    mrms_data_snow = np.zeros((1, 5), dtype=np.float32)
+    mrms_data_snow = np.zeros((1, 7), dtype=np.float32)
     mrms_data_snow[0, MRMS["precip_flag"]] = 3  # Snow
 
     result = _calculate_precip_type_probs(
@@ -223,7 +299,7 @@ def test_mrms_ptype_fallback():
     )
 
     # Rain flag
-    mrms_data_rain = np.zeros((1, 5), dtype=np.float32)
+    mrms_data_rain = np.zeros((1, 7), dtype=np.float32)
     mrms_data_rain[0, MRMS["precip_flag"]] = 1  # Rain
 
     result_rain = _calculate_precip_type_probs(
@@ -246,7 +322,7 @@ def test_mrms_ptype_fallback():
     )
 
     # Sleet flag (flag 7 = rain + hail; maps to sleet since no hail type)
-    mrms_data_sleet = np.zeros((1, 5), dtype=np.float32)
+    mrms_data_sleet = np.zeros((1, 7), dtype=np.float32)
     mrms_data_sleet[0, MRMS["precip_flag"]] = 7  # Rain + hail → sleet
 
     result_sleet = _calculate_precip_type_probs(
@@ -269,7 +345,7 @@ def test_mrms_ptype_fallback():
     )
 
     # No precip flag
-    mrms_data_none = np.zeros((1, 5), dtype=np.float32)
+    mrms_data_none = np.zeros((1, 7), dtype=np.float32)
     mrms_data_none[0, MRMS["precip_flag"]] = 0  # No precip
 
     result_none = _calculate_precip_type_probs(
@@ -298,7 +374,7 @@ def test_mrms_not_used_when_hrrr_available():
     from API.minutely.builder import _calculate_precip_type_probs
 
     # MRMS says snow (flag 3), HRRR SubH says rain
-    mrms_data_snow = np.zeros((1, 5), dtype=np.float32)
+    mrms_data_snow = np.zeros((1, 7), dtype=np.float32)
     mrms_data_snow[0, MRMS["precip_flag"]] = 3  # Snow
 
     # Mock HRRR SubH: all rain (column 4 in InterTminute = rain in HRRR_SUBH mapping)
@@ -413,28 +489,28 @@ def test_mrms_lightning_override_logic():
     thr = MRMS_LIGHTNING_THUNDERSTORM_THRESHOLD
 
     # --- Case 1: above threshold + active precip → should override ---
-    mrms_above = np.zeros((1, 5), dtype=np.float32)
+    mrms_above = np.zeros((1, 7), dtype=np.float32)
     mrms_above[0, lightning_idx] = thr * 2.0  # well above threshold
     assert _should_override(float(mrms_above[0, lightning_idx]), 1.0), (
         "Should trigger override when lightning above threshold with active precip"
     )
 
     # --- Case 2: exactly at threshold + active precip → should override ---
-    mrms_at = np.zeros((1, 5), dtype=np.float32)
+    mrms_at = np.zeros((1, 7), dtype=np.float32)
     mrms_at[0, lightning_idx] = thr
     assert _should_override(float(mrms_at[0, lightning_idx]), 0.5), (
         "Should trigger override when lightning equals threshold with active precip"
     )
 
     # --- Case 3: below threshold + active precip → should NOT override ---
-    mrms_below = np.zeros((1, 5), dtype=np.float32)
+    mrms_below = np.zeros((1, 7), dtype=np.float32)
     mrms_below[0, lightning_idx] = thr * 0.5
     assert not _should_override(float(mrms_below[0, lightning_idx]), 1.0), (
         "Should not override when lightning below threshold"
     )
 
     # --- Case 4: above threshold + NO precip → should NOT override ---
-    mrms_no_precip = np.zeros((1, 5), dtype=np.float32)
+    mrms_no_precip = np.zeros((1, 7), dtype=np.float32)
     mrms_no_precip[0, lightning_idx] = thr * 2.0
     assert not _should_override(float(mrms_no_precip[0, lightning_idx]), 0.0), (
         "Should not override when lightning is high but no precipitation"

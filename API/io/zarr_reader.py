@@ -134,6 +134,74 @@ class WeatherParallel(object):
         data_out = False
         return data_out
 
+    async def zarr_read_mrms_patch(
+        self,
+        opened_zarr,
+        x: int,
+        y: int,
+        var_idx: int,
+        radius: int,
+    ) -> Optional[tuple]:
+        """Asynchronously extract a 2-D rate patch from the MRMS zarr.
+
+        Returns the patch data and the centre-point indices within the patch,
+        clipped to the array boundaries.
+
+        Args:
+            opened_zarr: An open zarr array of shape ``(n_vars, n_time, ny, nx)``.
+            x:           Column index of the query point.
+            y:           Row index of the query point.
+            var_idx:     Variable index to extract (e.g. ``MRMS["precip_rate"]``).
+            radius:      Half-size of the square patch.  A value of *R* produces a
+                         patch of up to ``(2R+1, 2R+1)`` pixels.
+
+        Returns:
+            ``(patch, cy, cx)`` where *patch* is a 2-D float32 array of shape
+            ``(ny_patch, nx_patch)`` and ``(cy, cx)`` is the centre index inside
+            the patch, or ``None`` on failure.
+        """
+        err_count = 0
+        while err_count < MAX_ZARR_READ_RETRIES:
+            try:
+                result = await asyncio.to_thread(
+                    self._extract_mrms_patch,
+                    opened_zarr,
+                    x,
+                    y,
+                    var_idx,
+                    radius,
+                )
+                return result
+            except Exception:
+                self.logger.exception("### MRMS_PATCH Failure! %s", self.loc_tag)
+                err_count += 1
+        return None
+
+    @staticmethod
+    def _extract_mrms_patch(
+        opened_zarr,
+        x: int,
+        y: int,
+        var_idx: int,
+        radius: int,
+    ) -> Optional[tuple]:
+        """Synchronous helper called from the async thread pool."""
+        shape = opened_zarr.shape  # (n_vars, n_time, ny, nx)
+        ny_grid, nx_grid = shape[2], shape[3]
+
+        y_min = max(0, y - radius)
+        y_max = min(ny_grid, y + radius + 1)
+        x_min = max(0, x - radius)
+        x_max = min(nx_grid, x + radius + 1)
+
+        # zarr[var_idx, 0, y_min:y_max, x_min:x_max] → shape (ny_patch, nx_patch)
+        patch = opened_zarr[var_idx, 0, y_min:y_max, x_min:x_max].astype(np.float32)
+
+        cy = y - y_min  # centre row within patch
+        cx = x - x_min  # centre column within patch
+
+        return patch, cy, cx
+
 
 def update_zarr_store(
     initial_run: bool,

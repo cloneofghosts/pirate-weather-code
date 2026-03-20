@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -35,6 +36,80 @@ from API.constants.model_const import (
 from API.constants.shared_const import MISSING_DATA
 from API.utils.precip import dbz_to_rate
 from API.utils.source_priority import should_gfs_precede_dwd
+
+logger = logging.getLogger(__name__)
+
+
+# MRMS scan interval in minutes (MRMS updates every 2 minutes)
+_MRMS_SCAN_INTERVAL_MIN: float = 2.0
+
+
+def _compute_mrms_pysteps_nowcast(
+    rate_patch: np.ndarray,
+    cy: int,
+    cx: int,
+    u: float,
+    v: float,
+    n_steps: int = 61,
+    scan_interval_min: float = _MRMS_SCAN_INTERVAL_MIN,
+) -> Optional[np.ndarray]:
+    """Compute a pysteps semi-Lagrangian precipitation nowcast at a single point.
+
+    Uses the pre-computed pysteps Lucas–Kanade motion vectors (stored in the
+    MRMS zarr) to advect the observed rate patch forward in time, returning the
+    61-minute forecast at the centre pixel.
+
+    Args:
+        rate_patch:        2-D precipitation-rate field (mm/hr) centred on the
+                           query point; shape ``(ny_patch, nx_patch)``.
+        cy:                Row index of the query point within *rate_patch*.
+        cx:                Column index of the query point within *rate_patch*.
+        u:                 East–west motion component in pixels per scan-interval
+                           (positive = eastward).
+        v:                 North–south motion component in pixels per scan-interval
+                           (pysteps row convention).
+        n_steps:           Number of 1-minute forecast steps (default 61).
+        scan_interval_min: MRMS scan interval in minutes (default 2).
+
+    Returns:
+        1-D array of shape ``(n_steps,)`` with nowcasted rates (mm/hr), or
+        ``None`` if pysteps is unavailable or the computation fails.
+    """
+    try:
+        from pysteps.nowcasts import get_method as nowcasts_get_method
+    except ImportError:
+        logger.debug("pysteps not available; skipping MRMS nowcast")
+        return None
+
+    try:
+        ny_p, nx_p = rate_patch.shape
+
+        # Convert motion from pixels/scan-interval → pixels/minute
+        u_per_min = u / scan_interval_min
+        v_per_min = v / scan_interval_min
+
+        # Build a spatially uniform motion field for the patch (shape 2, ny, nx)
+        V = np.stack(
+            [
+                np.full((ny_p, nx_p), u_per_min, dtype=np.float64),
+                np.full((ny_p, nx_p), v_per_min, dtype=np.float64),
+            ]
+        )
+
+        # Replace NaN with 0 for the extrapolation kernel
+        R = np.nan_to_num(rate_patch.astype(np.float64), nan=0.0)
+
+        extrap = nowcasts_get_method("extrapolation")
+        # R_fc shape: (n_steps, ny_patch, nx_patch)
+        R_fc = extrap(R, V, n_steps)
+
+        # Extract the centre pixel and clip negative artefacts
+        forecast = np.maximum(R_fc[:, cy, cx].astype(np.float32), 0.0)
+        return forecast
+
+    except Exception:
+        logger.debug("pysteps nowcast failed; falling back to persistence", exc_info=True)
+        return None
 
 
 def _interp_gefs(minute_array_grib, gefs_data):
@@ -495,6 +570,7 @@ def _calculate_intensity(
     era5_MinuteInterpolation,
     mrms_data=None,
     minute_array_grib=None,
+    mrms_nowcast=None,
 ):
     """
     Calculate precipitation intensity.
@@ -509,8 +585,11 @@ def _calculate_intensity(
         gefsMinuteInterpolation: GEFS interpolated data.
         gfsMinuteInterpolation: GFS interpolated data.
         era5_MinuteInterpolation: ERA5 interpolated data.
-        mrms_data: MRMS single-timestep data array (optional).
+        mrms_data: MRMS data array, shape (n_timesteps, n_vars) (optional).
         minute_array_grib: Minutely UNIX timestamps (optional, needed for MRMS blending).
+        mrms_nowcast: Pre-computed pysteps 61-minute rate forecast (optional).
+            When provided this array is used as the MRMS intensity anchor instead
+            of simple Lagrangian persistence.  Shape: (61,), mm/hr.
 
     Returns:
         Tuple containing intensity array and updated precipitation types.
@@ -570,46 +649,55 @@ def _calculate_intensity(
             + era5_MinuteInterpolation[:, ERA5["convective_rain_rate"]]
         ) * 3600
 
-    # MRMS nowcasting: Lagrangian persistence + linear blend to model forecast.
+    # ── MRMS nowcasting ────────────────────────────────────────────────────────
     #
-    # MRMS provides the observed precipitation rate at the moment of the last
-    # radar scan.  A zero-order Lagrangian persistence nowcast holds that rate
-    # constant for a short window, then smoothly hands off to the model.
+    # MRMS provides the observed precipitation rate at the moment of the latest
+    # radar scan.  When a pysteps semi-Lagrangian nowcast is available (computed
+    # from the pre-stored motion vectors and local rate patch) it is used as the
+    # MRMS intensity anchor.  Otherwise the algorithm falls back to simple
+    # Lagrangian persistence for backward compatibility.
     #
-    # Timeline (seconds from MRMS scan time):
-    #   0 – MRMS_PERSISTENCE_S        : pure MRMS rate (persistence)
-    #   MRMS_PERSISTENCE_S – MRMS_PERSISTENCE_S+MRMS_BLEND_S : linear blend
-    #   > MRMS_PERSISTENCE_S+MRMS_BLEND_S : pure model forecast
+    # In both cases the MRMS anchor is blended linearly into the model forecast
+    # over the second half of the minutely window so that the two sources agree
+    # at the 61-minute horizon.
     #
-    # When no model forecast is available the rate is held at the MRMS value for
-    # the persistence window and then linearly fades to zero across the blend
-    # window.  This is much more sensible than decaying immediately to zero.
-    _MRMS_PERSISTENCE_S = 30 * 60  # 30 minutes of pure persistence
-    _MRMS_BLEND_S = 30 * 60  # 30 minutes of blending to model
-    if (
-        "mrms" in source_list
-        and mrms_data is not None
-        and minute_array_grib is not None
-    ):
+    # Timeline (minutes from latest MRMS scan time):
+    #   0–30 min : pure MRMS nowcast (pysteps or persistence)
+    #   30–60 min: linear blend MRMS → model
+    #   no model : hold MRMS for 30 min then fade to 0
+    _MRMS_BLEND_START_S = 30 * 60   # seconds: start blending at 30 min
+    _MRMS_BLEND_DURATION_S = 30 * 60  # seconds: complete blend by 60 min
+
+    if "mrms" in source_list and mrms_data is not None and minute_array_grib is not None:
         try:
             mrms_time = float(mrms_data[0, 0])
-            mrms_rate = float(mrms_data[0, MRMS["precip_rate"]])
-            if np.isfinite(mrms_rate) and np.isfinite(mrms_time):
-                dt = minute_array_grib - mrms_time
-                # alpha: 0 = full MRMS, 1 = full model
+            mrms_rate_obs = float(mrms_data[0, MRMS["precip_rate"]])
+
+            if np.isfinite(mrms_rate_obs) and np.isfinite(mrms_time):
+                dt = minute_array_grib - mrms_time  # seconds from scan time
+
+                # Build the 61-minute MRMS rate series
+                if mrms_nowcast is not None and len(mrms_nowcast) == len(dt):
+                    # pysteps extrapolation: index into the pre-computed forecast
+                    # (mrms_nowcast is already indexed by forecast minute 0..60)
+                    mrms_rate_series = mrms_nowcast.astype(np.float64)
+                else:
+                    # Fallback: zero-order persistence (same rate for all steps)
+                    mrms_rate_series = np.full(len(dt), mrms_rate_obs)
+
+                # Blend coefficient: 0 = pure MRMS, 1 = pure model
                 alpha = np.clip(
-                    (dt - _MRMS_PERSISTENCE_S) / _MRMS_BLEND_S, 0.0, 1.0
+                    (dt - _MRMS_BLEND_START_S) / _MRMS_BLEND_DURATION_S, 0.0, 1.0
                 )
-                valid_intensity_mask = ~np.isnan(intensity)
-                # Fade coefficient when no model data (falls to 0 at end of
-                # blend window rather than immediately)
-                fallback_alpha = np.clip(
-                    (dt - _MRMS_PERSISTENCE_S) / _MRMS_BLEND_S, 0.0, 1.0
+
+                valid_intensity_mask = np.isfinite(intensity) & (
+                    intensity != MISSING_DATA
                 )
                 blended = np.where(
                     valid_intensity_mask,
-                    mrms_rate * (1.0 - alpha) + intensity * alpha,
-                    mrms_rate * (1.0 - fallback_alpha),
+                    mrms_rate_series * (1.0 - alpha) + intensity * alpha,
+                    # No model: fade to 0 across the blend window
+                    mrms_rate_series * (1.0 - alpha),
                 )
                 intensity = blended
         except (IndexError, TypeError, ValueError):
@@ -774,6 +862,9 @@ def build_minutely_block(
     ecmwf_data: Optional[np.ndarray],
     era5_data: Optional[np.ndarray],
     mrms_data: Optional[np.ndarray] = None,
+    mrms_rate_patch: Optional[np.ndarray] = None,
+    mrms_patch_cy: Optional[int] = None,
+    mrms_patch_cx: Optional[int] = None,
     prep_intensity_unit: float,
     version: float,
     lat: float,
@@ -806,9 +897,16 @@ def build_minutely_block(
         gfs_data: GFS data.
         ecmwf_data: ECMWF data.
         era5_data: ERA5 data.
-        mrms_data: MRMS single-timestep data (optional). Used as a nowcasting
-            anchor for precipitation intensity and as a fallback precipitation
-            type source when HRRR is unavailable.
+        mrms_data: MRMS data array, shape (n_timesteps, n_vars) (optional).
+            Used as a nowcasting anchor for precipitation intensity and as a
+            fallback precipitation type source when HRRR is unavailable.
+        mrms_rate_patch: Local precipitation-rate field patch from the MRMS
+            zarr centred on the query point, shape (ny_patch, nx_patch).
+            Used together with the motion vectors in *mrms_data* to run a
+            pysteps semi-Lagrangian nowcast.  Pass ``None`` to fall back to
+            simple Lagrangian persistence.
+        mrms_patch_cy: Row index of the query point within *mrms_rate_patch*.
+        mrms_patch_cx: Column index of the query point within *mrms_rate_patch*.
         prep_intensity_unit: Precipitation intensity unit.
         version: API version.
         lat: Latitude of the location.
@@ -929,6 +1027,35 @@ def build_minutely_block(
     # This prevents truncation when assigning precipitation types later
     precipTypes = np.array(minuteType, dtype="U5")
 
+    # ── pysteps MRMS nowcast ──────────────────────────────────────────────────
+    # When a rate patch and pysteps motion vectors are available, compute a
+    # semi-Lagrangian extrapolation for the 61-minute forecast window.  The
+    # result is passed to _calculate_intensity as `mrms_nowcast` so that it
+    # replaces the simpler zero-order persistence.
+    mrms_nowcast: Optional[np.ndarray] = None
+    if (
+        "mrms" in source_list
+        and mrms_data is not None
+        and mrms_rate_patch is not None
+        and mrms_patch_cy is not None
+        and mrms_patch_cx is not None
+    ):
+        try:
+            u = float(mrms_data[0, MRMS["u_motion"]])
+            v = float(mrms_data[0, MRMS["v_motion"]])
+            if np.isfinite(u) and np.isfinite(v):
+                mrms_nowcast = _compute_mrms_pysteps_nowcast(
+                    mrms_rate_patch,
+                    mrms_patch_cy,
+                    mrms_patch_cx,
+                    u,
+                    v,
+                    n_steps=len(minute_array_grib),
+                    scan_interval_min=_MRMS_SCAN_INTERVAL_MIN,
+                )
+        except (IndexError, TypeError, ValueError):
+            pass
+
     # Calculate Intensity (and update precipTypes for HRRR/DWD MOSMIX temperature-based fallback)
     intensity, precipTypes, refc_used = _calculate_intensity(
         source_list,
@@ -942,6 +1069,7 @@ def build_minutely_block(
         era5_MinuteInterpolation,
         mrms_data=mrms_data,
         minute_array_grib=minute_array_grib,
+        mrms_nowcast=mrms_nowcast,
     )
     InterPminute[:, DATA_MINUTELY["intensity"]] = intensity
 

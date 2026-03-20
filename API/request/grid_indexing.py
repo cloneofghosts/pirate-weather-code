@@ -6,7 +6,7 @@ import asyncio
 import datetime
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Union
 
 import numpy as np
@@ -38,7 +38,7 @@ from API.constants.grid_const import (
     RTMA_RU_Y_MAX,
     RTMA_RU_Y_MIN,
 )
-from API.constants.model_const import ERA5
+from API.constants.model_const import ERA5, MRMS, MRMS_PATCH_RADIUS
 from API.constants.shared_const import HISTORY_PERIODS
 from API.utils.geo import lambertGridMatch
 from API.utils.timing import StepTimer
@@ -110,6 +110,13 @@ class GridIndexingResult:
     mrms_lon: Union[float, None]
     sourceIDX: dict
     WMO_alertDat: Union[str, None]
+    # MRMS precip-rate patch for pysteps Lagrangian advection.
+    # Shape: (ny_patch, nx_patch), or None when unavailable.
+    # These default to None so that callers that pre-date the patch feature
+    # (e.g., existing tests) do not need to pass them explicitly.
+    mrms_rate_patch: Union[np.ndarray, None] = field(default=None)
+    mrms_patch_cy: Union[int, None] = field(default=None)  # centre row within the patch
+    mrms_patch_cx: Union[int, None] = field(default=None)  # centre col within the patch
 
 
 async def calculate_grid_indexing(
@@ -492,6 +499,13 @@ async def calculate_grid_indexing(
         )
     if readMRMS:
         zarrTasks["MRMS"] = weather.zarr_read("MRMS", zarr_sources.mrms, x_mrms, y_mrms)
+        zarrTasks["MRMS_PATCH"] = weather.zarr_read_mrms_patch(
+            zarr_sources.mrms,
+            x_mrms,
+            y_mrms,
+            MRMS["precip_rate"],
+            MRMS_PATCH_RADIUS,
+        )
 
     WMO_alertDat = None
     if read_wmo_alerts:
@@ -668,6 +682,9 @@ async def calculate_grid_indexing(
 
     if readMRMS:
         dataOut_mrms = zarr_results["MRMS"]
+        mrms_rate_patch = None
+        mrms_patch_cy = None
+        mrms_patch_cx = None
         if dataOut_mrms is not False:
             mrms_time_val = dataOut_mrms[0, 0]
             try:
@@ -685,11 +702,18 @@ async def calculate_grid_indexing(
                         "lat": round(mrms_lat, 3),
                         "lon": round(mrms_lon, 3),
                     }
+                    # Retrieve the rate patch (may be None if the task failed)
+                    patch_result = zarr_results.get("MRMS_PATCH")
+                    if patch_result is not None:
+                        mrms_rate_patch, mrms_patch_cy, mrms_patch_cx = patch_result
             except (ValueError, TypeError, AttributeError):
                 dataOut_mrms = False
                 logger.debug("Failed to parse MRMS timestamp")
     else:
         dataOut_mrms = False
+        mrms_rate_patch = None
+        mrms_patch_cy = None
+        mrms_patch_cx = None
 
     if readDWD_MOSMIX:
         dataOut_dwd_mosmix = zarr_results["DWD_MOSMIX"]
@@ -794,6 +818,9 @@ async def calculate_grid_indexing(
         y_mrms=y_mrms,
         mrms_lat=mrms_lat,
         mrms_lon=mrms_lon,
+        mrms_rate_patch=mrms_rate_patch,
+        mrms_patch_cy=mrms_patch_cy,
+        mrms_patch_cx=mrms_patch_cx,
         sourceIDX=sourceIDX,
         WMO_alertDat=WMO_alertDat,
     )

@@ -3,12 +3,20 @@
 # (noaa-mrms-pds) using anonymous S3 access.
 #
 # Products ingested (all CONUS):
-#   - PrecipRate:                    Surface precipitation rate (mm/hr)
-#   - PrecipFlag:                    Categorical precipitation type
-#   - MergedCompositeReflectivityQC: Column-maximum composite reflectivity (dBZ);
-#                                    full CONUS coverage (replaces limited-coverage
-#                                    1-km AGL product)
-#   - LightningFlashRateDensity:     Lightning flash rate density (flashes/km²/min)
+#   - PrecipRate:              Surface precipitation rate (mm/hr)
+#   - PrecipFlag:              Categorical precipitation type
+#   - SeamlessHSR:             Seamless Hybrid Scan Reflectivity (dBZ);
+#                              near-surface product that adapts to the lowest
+#                              unobstructed tilt – reduces false-positive
+#                              precipitation reports from elevated beams
+#   - LightningFlashRateDensity: Lightning flash rate density (flashes/km²/min)
+#
+# Nowcast motion field:
+#   The two most recent PrecipRate scans are downloaded and fed to the pysteps
+#   Lucas–Kanade optical-flow algorithm to derive a dense motion vector field
+#   (u east–west, v north–south) stored as additional zarr variables.  The API
+#   uses these vectors together with a local rate-field patch to run a pysteps
+#   semi-Lagrangian extrapolation for each request.
 #
 # Data updates every 2 minutes.  The script checks whether the stored data is
 # already current and exits early if no update is required.
@@ -83,7 +91,7 @@ MRMS_BUCKET = "noaa-mrms-pds"
 MRMS_PRODUCT_LEVELS = {
     "PrecipRate": "00.00",
     "PrecipFlag": "00.00",
-    "MergedCompositeReflectivityQC": "00.50",
+    "SeamlessHSR": "00.00",
     "LightningFlashRateDensity": "00.00",
 }
 
@@ -130,8 +138,34 @@ def find_latest_mrms_s3_path(product: str, level: str) -> tuple[str, str]:
     Raises:
         FileNotFoundError: If no matching file is found in either date directory.
     """
+    paths = find_n_latest_mrms_s3_paths(product, level, n=1)
+    return paths[0]
+
+
+def find_n_latest_mrms_s3_paths(
+    product: str, level: str, n: int = 2
+) -> list[tuple[str, str]]:
+    """
+    Find the *n* most recently available MRMS GRIB2 files for *product*.
+
+    Searches today's and yesterday's date directories (UTC).  Returns a list
+    of ``(s3_path, timestamp_utc_str)`` tuples ordered newest-first.
+
+    Args:
+        product: MRMS product name, e.g. ``"PrecipRate"``.
+        level:   Level string used in the filename, e.g. ``"00.00"``.
+        n:       Maximum number of files to return (default 2).
+
+    Returns:
+        List of ``(s3_path, timestamp_utc_str)`` tuples, newest-first.
+        May be shorter than *n* if fewer files exist.
+
+    Raises:
+        FileNotFoundError: If no matching file is found in either date directory.
+    """
     now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     pattern = f"{product}_{level}_"
+    all_matching: list[str] = []
 
     for days_back in range(0, 2):
         date = now_utc - datetime.timedelta(days=days_back)
@@ -141,21 +175,22 @@ def find_latest_mrms_s3_path(product: str, level: str) -> tuple[str, str]:
             files = s3_mrms.ls(prefix)
         except Exception:
             continue
-
-        matching = sorted(
-            [f for f in files if pattern in f and f.endswith(".grib2.gz")]
+        all_matching.extend(
+            f for f in files if pattern in f and f.endswith(".grib2.gz")
         )
-        if matching:
-            latest = matching[-1]
-            # Extract timestamp from filename: <product>_<level>_<YYYYMMDD-HHMMSS>.grib2.gz
-            ts_part = os.path.basename(latest).split(pattern)[-1].replace(
-                ".grib2.gz", ""
-            )
-            return latest, ts_part
 
-    raise FileNotFoundError(
-        f"No MRMS {product} files found in the last 2 days on s3://{MRMS_BUCKET}"
-    )
+    if not all_matching:
+        raise FileNotFoundError(
+            f"No MRMS {product} files found in the last 2 days on s3://{MRMS_BUCKET}"
+        )
+
+    # Sort newest-first and take up to n
+    all_matching = sorted(all_matching, reverse=True)[:n]
+    result = []
+    for path in all_matching:
+        ts_part = os.path.basename(path).split(pattern)[-1].replace(".grib2.gz", "")
+        result.append((path, ts_part))
+    return result
 
 
 def download_mrms_grib(s3_path: str, out_dir: str) -> str:
@@ -215,9 +250,11 @@ t0 = time.time()
 
 logging.info("Searching for latest MRMS PrecipRate ...")
 try:
-    rate_s3_path, base_ts_str = find_latest_mrms_s3_path(
-        "PrecipRate", MRMS_PRODUCT_LEVELS["PrecipRate"]
+    # Fetch the two most recent PrecipRate scans; the second is used for motion estimation
+    rate_paths = find_n_latest_mrms_s3_paths(
+        "PrecipRate", MRMS_PRODUCT_LEVELS["PrecipRate"], n=2
     )
+    rate_s3_path, base_ts_str = rate_paths[0]
 except FileNotFoundError as exc:
     logging.error(str(exc))
     sys.exit(1)
@@ -245,11 +282,12 @@ else:
             logging.info("No Update to MRMS, ending")
             sys.exit()
 
-# %% Download all four products
+# %% Download all four observation products
 
 logging.info("Downloading MRMS products from S3 ...")
 
 arr_rate = None
+arr_rate_prev = None  # Previous scan for motion estimation
 arr_flag = None
 arr_refl = None
 arr_lightning = None
@@ -257,9 +295,9 @@ arr_lightning = None
 products_to_download = {
     "PrecipRate": ("PrecipRate", MRMS_PRODUCT_LEVELS["PrecipRate"]),
     "PrecipFlag": ("PrecipFlag", MRMS_PRODUCT_LEVELS["PrecipFlag"]),
-    "MergedCompositeReflectivityQC": (
-        "MergedCompositeReflectivityQC",
-        MRMS_PRODUCT_LEVELS["MergedCompositeReflectivityQC"],
+    "SeamlessHSR": (
+        "SeamlessHSR",
+        MRMS_PRODUCT_LEVELS["SeamlessHSR"],
     ),
     "LightningFlashRateDensity": (
         "LightningFlashRateDensity",
@@ -277,12 +315,22 @@ for key, (product, level) in products_to_download.items():
             arr_rate = arr
         elif key == "PrecipFlag":
             arr_flag = arr
-        elif key == "MergedCompositeReflectivityQC":
+        elif key == "SeamlessHSR":
             arr_refl = arr
         elif key == "LightningFlashRateDensity":
             arr_lightning = arr
     except Exception:
         logging.exception(f"Failed to download/process {product}; using NaN fill")
+
+# Download the previous PrecipRate scan for motion estimation (second most-recent)
+if len(rate_paths) >= 2:
+    prev_rate_s3_path, prev_ts_str = rate_paths[1]
+    try:
+        grib_path_prev = download_mrms_grib(prev_rate_s3_path, tmp_dir)
+        arr_rate_prev = read_grib2_to_array(grib_path_prev)
+        logging.info(f"Previous PrecipRate scan: shape={arr_rate_prev.shape} ({prev_ts_str})")
+    except Exception:
+        logging.warning("Failed to download previous PrecipRate scan; using NaN motion fill")
 
 logging.info("All MRMS products processed.")
 
@@ -311,6 +359,54 @@ arr_lightning = np.where(
     arr_lightning < -100, np.nan, np.clip(arr_lightning, 0, VALID_DATA_MAX)
 )
 
+# %% Compute pysteps Lucas–Kanade motion field
+#
+# Two consecutive PrecipRate scans are stacked and passed to pysteps.motion LK
+# to derive dense (u, v) motion vectors in pixels per scan-interval (2 minutes).
+# u is the east–west component (positive = east), v is the north–south component
+# in pysteps' row convention (positive = increasing row index = northward on the
+# MRMS grid).
+#
+# NaN values are filled with 0 before the LK call; the resulting motion field is
+# set to NaN where either input scan has invalid data.
+
+arr_u = np.full((ny, nx), np.nan, dtype=np.float32)
+arr_v = np.full((ny, nx), np.nan, dtype=np.float32)
+
+if arr_rate_prev is not None:
+    try:
+        from pysteps.motion import get_method as motion_get_method
+
+        # Clean the previous scan the same way as the current one
+        arr_rate_prev_clean = np.where(
+            arr_rate_prev < -100, np.nan, np.clip(arr_rate_prev, 0, VALID_DATA_MAX)
+        ).astype(np.float64)
+
+        # pysteps LK expects shape (num_timesteps, ny, nx) and dislikes NaNs –
+        # replace NaN with 0 for the optical-flow computation
+        R_prev = np.nan_to_num(arr_rate_prev_clean, nan=0.0)
+        R_curr = np.nan_to_num(arr_rate.astype(np.float64), nan=0.0)
+        R_stack = np.stack([R_prev, R_curr])  # shape (2, ny, nx)
+
+        lk = motion_get_method("LK")
+        V = lk(R_stack)  # shape (2, ny, nx): V[0]=u (x/col), V[1]=v (y/row)
+
+        arr_u = V[0].astype(np.float32)
+        arr_v = V[1].astype(np.float32)
+
+        logging.info(
+            f"pysteps LK motion computed: "
+            f"u range [{arr_u.min():.2f}, {arr_u.max():.2f}] px/scan, "
+            f"v range [{arr_v.min():.2f}, {arr_v.max():.2f}] px/scan"
+        )
+    except Exception:
+        logging.warning(
+            "pysteps LK optical-flow failed; motion vectors set to NaN",
+            exc_info=True,
+        )
+else:
+    logging.info("No previous PrecipRate scan available; motion vectors set to NaN")
+
 # %% Build Unix timestamp
 
 base_time_unix = np.int64(
@@ -323,15 +419,17 @@ base_time_unix = np.int64(
 logging.info(f"MRMS base time (Unix): {base_time_unix}")
 
 # %% Build the Zarr store
-# Shape: (num_vars=5, 1, ny, nx)
-# Variable order: time, precip_rate, precip_flag, refl_comp, lightning
-num_vars = 5
+# Shape: (num_vars=7, 1, ny, nx)
+# Variable order: time, precip_rate, precip_flag, refl_sfc, lightning, u_motion, v_motion
+num_vars = 7
 zarr_data = np.full((num_vars, 1, ny, nx), np.nan, dtype=np.float32)
 zarr_data[0, 0, :, :] = base_time_unix  # time
 zarr_data[1, 0, :, :] = arr_rate        # precip_rate (mm/hr)
 zarr_data[2, 0, :, :] = arr_flag        # precip_flag (categorical)
-zarr_data[3, 0, :, :] = arr_refl        # refl_comp (dBZ)
+zarr_data[3, 0, :, :] = arr_refl        # refl_sfc / SeamlessHSR (dBZ)
 zarr_data[4, 0, :, :] = arr_lightning   # lightning (flashes/km²/min)
+zarr_data[5, 0, :, :] = arr_u           # u_motion (pixels/scan-interval, +east)
+zarr_data[6, 0, :, :] = arr_v           # v_motion (pixels/scan-interval, pysteps row convention)
 
 logging.info(
     f"Zarr data shape: {zarr_data.shape}, "

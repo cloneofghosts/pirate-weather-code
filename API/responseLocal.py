@@ -511,6 +511,9 @@ async def PW_Forecast(
     dataOut_rtma_ru = grid_result.dataOut_rtma_ru
     dataOut_dwd_mosmix = grid_result.dataOut_dwd_mosmix
     dataOut_mrms = grid_result.dataOut_mrms
+    mrms_rate_patch = grid_result.mrms_rate_patch
+    mrms_patch_cy = grid_result.mrms_patch_cy
+    mrms_patch_cx = grid_result.mrms_patch_cx
     WMO_alertDat = grid_result.WMO_alertDat
 
     ERA5_MERGED = grid_result.era5_merged
@@ -652,6 +655,9 @@ async def PW_Forecast(
             ecmwf_data=dataOut_ecmwf if "ecmwf_ifs" in sourceList else None,
             era5_data=ERA5_MERGED if isinstance(ERA5_MERGED, np.ndarray) else None,
             mrms_data=dataOut_mrms if isinstance(dataOut_mrms, np.ndarray) else None,
+            mrms_rate_patch=mrms_rate_patch,
+            mrms_patch_cy=mrms_patch_cy,
+            mrms_patch_cx=mrms_patch_cx,
             prep_intensity_unit=prepIntensityUnit,
             version=version,
             lat=lat,
