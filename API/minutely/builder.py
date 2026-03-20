@@ -89,12 +89,9 @@ def _compute_mrms_pysteps_nowcast(
         v_per_min = v / scan_interval_min
 
         # Build a spatially uniform motion field for the patch (shape 2, ny, nx)
-        V = np.stack(
-            [
-                np.full((ny_p, nx_p), u_per_min, dtype=np.float64),
-                np.full((ny_p, nx_p), v_per_min, dtype=np.float64),
-            ]
-        )
+        V = np.empty((2, ny_p, nx_p), dtype=np.float64)
+        V[0] = u_per_min
+        V[1] = v_per_min
 
         # Replace NaN with 0 for the extrapolation kernel
         R = np.nan_to_num(rate_patch.astype(np.float64), nan=0.0)
