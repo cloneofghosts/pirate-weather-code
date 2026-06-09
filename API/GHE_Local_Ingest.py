@@ -241,8 +241,10 @@ def _compute_nowcast(
     velocity = dense_lucaskanade(dbr_stack)  # shape (2, lat, lon)
     logging.info("Motion field estimated. Running %d-frame extrapolation …", n_frames)
 
-    # Semi-Lagrangian extrapolation in dBR space
-    # vel_timestep=1 means velocity is in pixels-per-input-time-step
+    # Semi-Lagrangian extrapolation in dBR space.
+    # vel_timestep=1 means the velocity field is expressed in pixels per one
+    # input time-step (i.e. pixels per GHE_INTERVAL_MIN minutes), so each
+    # extrapolated frame is displaced by exactly one interval's worth of motion.
     nowcast_dbr = extrapolate(
         dbr_stack[-1],
         velocity,
@@ -353,7 +355,8 @@ dask_var_array = da.from_array(
     chunks=(n_vars, n_times, process_chunk, process_chunk),
 )
 
-# Clip rain rate to valid range (leave time dim untouched)
+# Clip rain rate to valid range; time values (var index 0) are Unix timestamps
+# and must not be clipped, so only the rain_rate slice (index 1) is processed.
 rr_slice = dask_var_array[1]  # shape (n_times, n_lat, n_lon)
 rr_slice = da.clip(rr_slice, 0.0, VALID_DATA_MAX)
 dask_var_array = da.concatenate(
