@@ -171,6 +171,10 @@ DWD_MOSMIX = {
     "solar": 12,  # DSWRF_surface (W/m^2)
 }
 
+GHE = {
+    "rain_rate": 1,  # Rain rate in mm/h (from NOAA GHE + pysteps nowcast)
+}
+
 # Source names that provide forecast data (i.e. not current-conditions-only or elevation).
 # Used to validate that at least one forecast model is available for a request.
 # "hrrr" is the time-machine key for HRRR; "era5" covers historical time-machine requests.

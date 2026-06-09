@@ -170,6 +170,12 @@ def build_source_metadata(
     if isinstance(grid_result.dataOut_gefs, np.ndarray):
         metadata.add("gefs", time_value=_format_run_time(grid_result.gefsRunTime))
 
+    if isinstance(grid_result.dataOut_ghe, np.ndarray) and not time_machine:
+        metadata.add(
+            "ghe",
+            time_value=_format_run_time(grid_result.gheRunTime),
+        )
+
     return metadata
 
 

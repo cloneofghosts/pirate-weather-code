@@ -53,6 +53,7 @@ class ZarrSources:
     wmo_alerts: Any
     era5_data: Any
     dwd_mosmix: Any = None
+    ghe: Any = None
 
 
 @dataclass
@@ -67,6 +68,7 @@ class GridIndexingResult:
     dataOut_gefs: Union[np.ndarray, bool]
     dataOut_rtma_ru: Union[np.ndarray, bool]
     dataOut_dwd_mosmix: Union[np.ndarray, bool]
+    dataOut_ghe: Union[np.ndarray, bool]
     era5_merged: Union[np.ndarray, bool]
     subhRunTime: Union[float, None]
     hrrrhRunTime: Union[float, None]
@@ -77,6 +79,7 @@ class GridIndexingResult:
     ecmwfRunTime: Union[float, None]
     gefsRunTime: Union[float, None]
     dwdMosmixRunTime: Union[float, None]
+    gheRunTime: Union[float, None]
     x_rtma: Union[float, None]
     y_rtma: Union[float, None]
     rtma_lat: Union[float, None]
@@ -97,6 +100,10 @@ class GridIndexingResult:
     y_dwd: Union[float, None]
     dwd_lat: Union[float, None]
     dwd_lon: Union[float, None]
+    x_ghe: Union[float, None]
+    y_ghe: Union[float, None]
+    ghe_lat: Union[float, None]
+    ghe_lon: Union[float, None]
     sourceIDX: dict
     WMO_alertDat: Union[str, None]
 
@@ -382,6 +389,32 @@ async def calculate_grid_indexing(
 
     timer.log("### DWD MOSMIX Detail END ###")
 
+    timer.log("### GHE Detail Start ###")
+
+    # GHE uses a regular lat/lon grid at ~0.036° resolution, 60S-60N
+    # Longitudes run 0-360 to match the GFS convention in this codebase.
+    # Only available for non-time-machine requests (it's a nowcast product).
+    GHE_LAT_RES = 0.036
+    GHE_LON_RES = 0.036
+    dataOut_ghe = False
+    x_ghe = None
+    y_ghe = None
+    ghe_lat = None
+    ghe_lon = None
+    readGHE = False
+    if not time_machine and zarr_sources.ghe is not None and abs(lat) <= 60:
+        lats_ghe = np.arange(-60, 60, GHE_LAT_RES)
+        lons_ghe = np.arange(0, 360, GHE_LON_RES)
+        abslat_ghe = np.abs(lats_ghe - lat)
+        abslon_ghe = np.abs(lons_ghe - lon)
+        y_ghe = int(np.argmin(abslat_ghe))
+        x_ghe = int(np.argmin(abslon_ghe))
+        ghe_lat = float(lats_ghe[y_ghe])
+        ghe_lon = float(lons_ghe[x_ghe])
+        readGHE = True
+
+    timer.log("### GHE Detail END ###")
+
     if readERA5:
         abslat_era5 = np.abs(zarr_sources.era5_data["ERA5_lats"] - lat)
         abslon_era5 = np.abs(zarr_sources.era5_data["ERA5_lons"] - lon)
@@ -443,6 +476,8 @@ async def calculate_grid_indexing(
         zarrTasks["DWD_MOSMIX"] = weather.zarr_read(
             "DWD_MOSMIX", zarr_sources.dwd_mosmix, x_dwd, y_dwd
         )
+    if readGHE:
+        zarrTasks["GHE"] = weather.zarr_read("GHE", zarr_sources.ghe, x_ghe, y_ghe)
 
     WMO_alertDat = None
     if read_wmo_alerts:
@@ -468,6 +503,7 @@ async def calculate_grid_indexing(
     ecmwfRunTime = None
     gefsRunTime = None
     dwdMosmixRunTime = None
+    gheRunTime = None
 
     if readHRRR:
         dataOut = zarr_results["SubH"]
@@ -674,6 +710,31 @@ async def calculate_grid_indexing(
                 # Data array too short, treat as no data available
                 dataOut_dwd_mosmix = False
 
+    if readGHE:
+        dataOut_ghe = zarr_results["GHE"]
+        if dataOut_ghe is not False:
+            try:
+                # Index 0 is the current (frame 0) timestamp, column 0 is time
+                ghe_time = dataOut_ghe[0, 0]
+                timestamp_dt = datetime.datetime.fromtimestamp(
+                    int(ghe_time), datetime.UTC
+                ).replace(tzinfo=None)
+                # Discard if older than 30 minutes (2 missed cycles)
+                if (utc_time - timestamp_dt) > datetime.timedelta(minutes=30):
+                    dataOut_ghe = False
+                    logger.warning("OLD GHE")
+                else:
+                    gheRunTime = ghe_time
+                    sourceIDX["ghe"] = {
+                        "x": int(x_ghe),
+                        "y": int(y_ghe),
+                        "lat": round(ghe_lat, 3),
+                        "lon": round(((ghe_lon + 180) % 360) - 180, 3),
+                    }
+            except (ValueError, TypeError, AttributeError):
+                logger.debug("Failed to parse GHE runtime for freshness check")
+                dataOut_ghe = False
+
     return GridIndexingResult(
         dataOut=dataOut,
         dataOut_h2=dataOut_h2,
@@ -685,6 +746,7 @@ async def calculate_grid_indexing(
         dataOut_gefs=dataOut_gefs,
         dataOut_rtma_ru=dataOut_rtma_ru,
         dataOut_dwd_mosmix=dataOut_dwd_mosmix,
+        dataOut_ghe=dataOut_ghe,
         era5_merged=ERA5_MERGED,
         subhRunTime=subhRunTime,
         hrrrhRunTime=hrrrhRunTime,
@@ -695,6 +757,7 @@ async def calculate_grid_indexing(
         ecmwfRunTime=ecmwfRunTime,
         gefsRunTime=gefsRunTime,
         dwdMosmixRunTime=dwdMosmixRunTime,
+        gheRunTime=gheRunTime,
         x_rtma=x_rtma,
         y_rtma=y_rtma,
         rtma_lat=rtma_lat,
@@ -715,6 +778,10 @@ async def calculate_grid_indexing(
         y_dwd=y_dwd,
         dwd_lat=dwd_lat,
         dwd_lon=dwd_lon,
+        x_ghe=x_ghe,
+        y_ghe=y_ghe,
+        ghe_lat=ghe_lat,
+        ghe_lon=ghe_lon,
         sourceIDX=sourceIDX,
         WMO_alertDat=WMO_alertDat,
     )

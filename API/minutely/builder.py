@@ -26,6 +26,7 @@ from API.constants.model_const import (
     ERA5,
     GEFS,
     GFS,
+    GHE,
     HRRR,
     HRRR_SUBH,
     NBM,
@@ -291,6 +292,41 @@ def _interp_dwd_mosmix(minute_array_grib, dwd_mosmix_data):
     return dwd_mosmix_MinuteInterpolation
 
 
+def _interp_ghe(minute_array_grib, ghe_data):
+    """
+    Interpolate GHE nowcast rain-rate data to minutely intervals.
+
+    The GHE zarr store holds 9 time frames (1 observation + 8 pysteps nowcast
+    frames at 15-min intervals).  Only the rain-rate column is interpolated
+    here; temperature-based precip-type determination is handled separately
+    using data from other models.
+
+    Args:
+        minute_array_grib: Minutely time array (Unix seconds).
+        ghe_data: GHE data array with shape (n_frames, 2) where column 0 is
+            Unix timestamps and column 1 is rain rate in mm/h.
+
+    Returns:
+        Interpolated array of shape (len(minute_array_grib), 2) with columns
+        [time, rain_rate], or None if input is invalid.
+    """
+    if ghe_data is None or len(ghe_data) == 0:
+        return None
+
+    ghe_times = ghe_data[:, 0].squeeze()
+    ghe_rr = ghe_data[:, GHE["rain_rate"]].squeeze()
+
+    ghe_interp = np.zeros((len(minute_array_grib), max(GHE.values()) + 1))
+    ghe_interp[:, GHE["rain_rate"]] = np.interp(
+        minute_array_grib,
+        ghe_times,
+        ghe_rr,
+        left=MISSING_DATA,
+        right=MISSING_DATA,
+    )
+    return ghe_interp
+
+
 def _calculate_prob(
     minute_array_grib,
     source_list,
@@ -463,6 +499,7 @@ def _calculate_intensity(
     source_list,
     precipTypes,
     hrrrSubHInterpolation,
+    gheInterpolation,
     nbmMinuteInterpolation,
     dwd_mosmix_MinuteInterpolation,
     ecmwfMinuteInterpolation,
@@ -477,6 +514,7 @@ def _calculate_intensity(
         source_list: List of data sources.
         precipTypes: Array of precipitation types.
         hrrrSubHInterpolation: HRRR sub-hourly interpolated data.
+        gheInterpolation: GHE nowcast interpolated rain-rate data.
         nbmMinuteInterpolation: NBM interpolated data.
         dwd_mosmix_MinuteInterpolation: DWD MOSMIX interpolated data.
         ecmwfMinuteInterpolation: ECMWF interpolated data.
@@ -505,6 +543,33 @@ def _calculate_intensity(
         )
         intensity = dbz_to_rate(refc_arr, precipTypes)
         refc_used = True
+    elif "ghe" in source_list and gheInterpolation is not None:
+        # GHE provides direct satellite-derived rain rate (mm/h) globally.
+        # Use temperature from HRRR SubH or GFS to determine precipitation type
+        # when the type has not already been set.
+        rr_arr = gheInterpolation[:, GHE["rain_rate"]]
+        intensity = np.maximum(rr_arr, 0.0)
+
+        # Determine precip type from temperature (use best available source)
+        if hrrrSubHInterpolation is not None:
+            temp_arr = hrrrSubHInterpolation[:, HRRR_SUBH["temp"]]
+        elif gfsMinuteInterpolation is not None:
+            temp_arr = gfsMinuteInterpolation[:, GFS["temp"]]
+        else:
+            temp_arr = None
+
+        if temp_arr is not None:
+            mask = (precipTypes == PRECIP_TYPES["none"]) & (intensity > 0)
+            precipTypes[mask] = np.where(
+                temp_arr[mask] >= TEMP_THRESHOLD_RAIN_C,
+                PRECIP_TYPES["rain"],
+                np.where(
+                    temp_arr[mask] <= TEMP_THRESHOLD_SNOW_C,
+                    PRECIP_TYPES["snow"],
+                    PRECIP_TYPES["sleet"],
+                ),
+            )
+        refc_used = True  # treat as observational quality — skip noise thresholding
     elif "nbm" in source_list and nbmMinuteInterpolation is not None:
         intensity = nbmMinuteInterpolation[:, NBM["accum"]]
     elif "dwd_mosmix" in source_list and dwd_mosmix_MinuteInterpolation is not None:
@@ -700,6 +765,7 @@ def build_minutely_block(
     gfs_data: Optional[np.ndarray],
     ecmwf_data: Optional[np.ndarray],
     era5_data: Optional[np.ndarray],
+    ghe_data: Optional[np.ndarray] = None,
     prep_intensity_unit: float,
     version: float,
     lat: float,
@@ -732,6 +798,7 @@ def build_minutely_block(
         gfs_data: GFS data.
         ecmwf_data: ECMWF data.
         era5_data: ERA5 data.
+        ghe_data: GHE nowcast rain-rate data (1 observed + 8 nowcast frames).
         prep_intensity_unit: Precipitation intensity unit.
         version: API version.
         lat: Latitude of the location.
@@ -770,6 +837,9 @@ def build_minutely_block(
         _interp_dwd_mosmix(minute_array_grib, dwd_mosmix_data)
         if "dwd_mosmix" in source_list
         else None
+    )
+    gheInterpolation = (
+        _interp_ghe(minute_array_grib, ghe_data) if "ghe" in source_list else None
     )
 
     # Handle GEFS error interpolation inside HRRR block logic from original code
@@ -856,6 +926,7 @@ def build_minutely_block(
         source_list,
         precipTypes,
         hrrrSubHInterpolation,
+        gheInterpolation,
         nbmMinuteInterpolation,
         dwd_mosmix_MinuteInterpolation,
         ecmwfMinuteInterpolation,

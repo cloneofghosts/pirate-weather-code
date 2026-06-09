@@ -14,8 +14,10 @@ netCDF4==1.7.4
 numba==0.64.0
 numpy==2.3.3
 nwswx==0.1.2
+opencv-python-headless==4.11.0.86
 pyarrow==23.0.1
 pykml==0.2.0
+pysteps==1.21.1
 rioxarray==0.22.0
 s3fs==2026.2.0
 scikit-learn==1.8.0
