@@ -5,6 +5,7 @@ from API.constants.shared_const import MISSING_DATA
 from API.constants.text_const import (
     DEFAULT_POP,
     DEFAULT_VISIBILITY,
+    PRECIP_PROB_THRESHOLD,
 )
 from API.PirateTextHelper import (
     calculate_precip_text,
@@ -116,6 +117,10 @@ def calculate_text(
     )
     thuText, thuIcon = calculate_thunderstorm_text(cape, "both", icon, isDayTime)
     skyText, skyIcon = calculate_sky_text(cloudCover, isDayTime, icon, "both")
+
+    # Prevent thunderstorm summary if pop is less than the threshold
+    if thuText == "thunderstorm" and pop < PRECIP_PROB_THRESHOLD:
+        thuText = "possible-thunderstorm"
 
     # If there is precipitation text use that and join with wind texts if they exist
     if precipText is not None:
