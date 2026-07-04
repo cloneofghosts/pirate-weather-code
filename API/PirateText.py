@@ -119,8 +119,11 @@ def calculate_text(
     skyText, skyIcon = calculate_sky_text(cloudCover, isDayTime, icon, "both")
 
     # Prevent thunderstorm summary if pop is less than the threshold
-    if thuText == "thunderstorm" and pop < PRECIP_PROB_THRESHOLD:
-        thuText = "possible-thunderstorm"
+    if pop < PRECIP_PROB_THRESHOLD:
+        if thuText == "thunderstorm":
+            thuText = "possible-thunderstorm"
+        if thuIcon == "thunderstorm":
+            thuIcon = None
 
     # If there is precipitation text use that and join with wind texts if they exist
     if precipText is not None:
